@@ -25,6 +25,7 @@ EAS_USERNAME = os.environ.get("EAS_USERNAME", "")
 EAS_PASSWORD = os.environ.get("EAS_PASSWORD", "")
 EAS_DEVICE_ID = os.environ.get("EAS_DEVICE_ID", "EAS0LEGCLIENT0001")
 EAS_PROTOCOL = os.environ.get("EAS_PROTOCOL", "14.1")
+EAS_EMAIL = os.environ.get("EAS_EMAIL", "")
 
 
 # ============================================================
