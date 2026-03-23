@@ -6,6 +6,10 @@ Handles WBXML encoding/decoding and EAS protocol commands.
 import io
 import json
 import logging
+import uuid
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -229,10 +233,12 @@ class EASClient:
     def __init__(self, host: str, username: str, password: str,
                  device_id: str = "EAS0LEGCLIENT0001",
                  device_type: str = "EASClient",
-                 protocol_version: str = "14.1"):
+                 protocol_version: str = "14.1",
+                 email_address: str = ""):
         self.host = host
         self.url = f"https://{host}/Microsoft-Server-ActiveSync"
         self.username = username
+        self.email_address = email_address or username
         self.device_id = device_id
         self.device_type = device_type
         self.protocol_version = protocol_version
@@ -436,3 +442,197 @@ class EASClient:
         if cur.get("FileAs") or cur.get("FirstName"):
             contacts.append(cur)
         return contacts
+
+    # --- SendMail ---
+    def send_email(self, to: str, subject: str, body: str,
+                   cc: str = "", content_type: str = "plain") -> dict:
+        """Send an email via EAS SendMail command.
+        
+        Args:
+            to: Recipient email (comma-separated for multiple)
+            subject: Email subject
+            body: Email body text
+            cc: CC recipients (optional)
+            content_type: 'plain' or 'html'
+        
+        Returns:
+            dict with status
+        """
+        # Build MIME message
+        msg = MIMEText(body, content_type, "utf-8")
+        msg["From"] = self.email_address
+        msg["To"] = to
+        msg["Subject"] = subject
+        if cc:
+            msg["Cc"] = cc
+        msg["Date"] = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
+        msg["Message-ID"] = f"<{uuid.uuid4()}@eas-mcp>"
+
+        mime_data = msg.as_bytes()
+
+        # SendMail uses raw MIME, not WBXML
+        # But needs a small WBXML wrapper with ClientId
+        client_id = str(uuid.uuid4())[:8]
+
+        # Build SendMail WBXML
+        enc = WBXMLEncoder()
+        # Page 21: ComposeMail
+        enc.switch(21)
+        # <SendMail> tag 0x05 with content
+        enc.buf.append(0x05 | 0x40)
+        # <ClientId> tag 0x11
+        enc.buf.append(0x11 | 0x40)
+        enc.string(client_id)
+        enc.end()
+        # <SaveInSentItems/> tag 0x08
+        enc.buf.append(0x08)
+        # <Mime> tag 0x10 with content (opaque data)
+        enc.buf.append(0x10 | 0x40)
+        # Write opaque: token 0xC3 + mb_uint32 length + data
+        enc.buf.append(0xC3)
+        # Encode length as mb_uint32
+        length = len(mime_data)
+        length_bytes = []
+        while True:
+            length_bytes.insert(0, length & 0x7F)
+            length >>= 7
+            if length == 0:
+                break
+        for i in range(len(length_bytes) - 1):
+            length_bytes[i] |= 0x80
+        enc.buf.extend(length_bytes)
+        enc.buf.extend(mime_data)
+        enc.end()  # Mime
+        enc.end()  # SendMail
+
+        resp = self._post("SendMail", enc.get())
+
+        if resp.status_code == 200:
+            # Empty 200 = success for SendMail
+            if not resp.content:
+                return {"status": "sent", "to": to, "subject": subject}
+            # Non-empty = error in WBXML
+            elements = self._decode(resp)
+            status = self._find(elements, "Status")
+            return {"status": f"error_{status}", "elements": elements}
+        else:
+            return {"status": f"HTTP {resp.status_code}"}
+
+    # --- Create Calendar Event ---
+    def create_event(self, subject: str, start_time: str, end_time: str,
+                     location: str = "", body: str = "",
+                     attendees: list = None, all_day: bool = False,
+                     reminder: int = 15) -> dict:
+        """Create a calendar event via EAS Sync Add command.
+        
+        Args:
+            subject: Event title
+            start_time: ISO format e.g. '2026-03-25T10:00:00.000Z'
+            end_time: ISO format e.g. '2026-03-25T11:00:00.000Z'
+            location: Event location (optional)
+            body: Event description (optional)
+            attendees: List of dicts [{"email": "...", "name": "..."}] (optional)
+            all_day: Whether it's an all-day event
+            reminder: Reminder in minutes (default 15)
+        
+        Returns:
+            dict with status and server_id
+        """
+        cal_id = self.find_folder(8)  # Calendar
+        if not cal_id:
+            return {"status": "error", "message": "Calendar folder not found"}
+
+        # Get sync key first
+        r1 = self.sync(cal_id, "0")
+        sync_key = r1.get("sync_key")
+        if not sync_key:
+            return {"status": "error", "message": "Failed to get SyncKey"}
+
+        client_id = str(uuid.uuid4())[:8]
+
+        enc = WBXMLEncoder()
+        # <Sync> page 0
+        enc.tag_open(0, 0x05)
+        # <Collections>
+        enc.tag_open(0, 0x1C)
+        # <Collection>
+        enc.tag_open(0, 0x0F)
+        # <SyncKey>
+        enc.tag_str(0, 0x0B, sync_key)
+        # <CollectionId>
+        enc.tag_str(0, 0x12, str(cal_id))
+        # <Commands>
+        enc.tag_open(0, 0x16)
+        # <Add>
+        enc.tag_open(0, 0x07)
+        # <ClientId>
+        enc.tag_str(0, 0x0C, client_id)
+        # <ApplicationData>
+        enc.tag_open(0, 0x1D)
+
+        # Calendar fields - page 4
+        # <Subject>
+        enc.tag_str(4, 0x26, subject)
+        # <StartTime>
+        enc.tag_str(4, 0x27, start_time)
+        # <EndTime>
+        enc.tag_str(4, 0x12, end_time)
+        # <Location>
+        if location:
+            enc.tag_str(4, 0x17, location)
+        # <AllDayEvent>
+        enc.tag_str(4, 0x06, "1" if all_day else "0")
+        # <BusyStatus> 2=Busy
+        enc.tag_str(4, 0x0D, "2")
+        # <MeetingStatus> 1=Meeting
+        enc.tag_str(4, 0x18, "1" if attendees else "0")
+        # <Reminder>
+        enc.tag_str(4, 0x24, str(reminder))
+        # <Sensitivity> 0=Normal
+        enc.tag_str(4, 0x25, "0")
+        # <DtStamp>
+        enc.tag_str(4, 0x11, datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
+        # <UID>
+        enc.tag_str(4, 0x28, str(uuid.uuid4()))
+
+        # Body - AirSyncBase page 17
+        if body:
+            enc.tag_open(17, 0x0A)  # Body
+            enc.tag_str(17, 0x06, "1")  # Type = plain text
+            enc.tag_str(17, 0x0B, body)  # Data
+            enc.end()  # Body
+
+        # Attendees
+        if attendees:
+            enc.tag_open(4, 0x07)  # Attendees
+            for att in attendees:
+                enc.tag_open(4, 0x08)  # Attendee
+                enc.tag_str(4, 0x09, att.get("email", ""))
+                enc.tag_str(4, 0x0A, att.get("name", att.get("email", "")))
+                enc.tag_str(4, 0x2A, "1")  # Type=Required
+                enc.tag_str(4, 0x29, "0")  # Status=None
+                enc.end()  # Attendee
+            enc.end()  # Attendees
+
+        enc.end()  # ApplicationData
+        enc.end()  # Add
+        enc.end()  # Commands
+        enc.end()  # Collection
+        enc.end()  # Collections
+        enc.end()  # Sync
+
+        resp = self._post("Sync", enc.get())
+
+        if resp.status_code == 200 and resp.content:
+            elements = self._decode(resp)
+            status = self._find(elements, "Status")
+            server_id = self._find(elements, "ServerId")
+            return {
+                "status": "created" if status == "1" else f"error_{status}",
+                "server_id": server_id,
+                "client_id": client_id,
+            }
+        elif resp.status_code == 200:
+            return {"status": "created", "client_id": client_id}
+        else:
+            return {"status": f"HTTP {resp.status_code}"}

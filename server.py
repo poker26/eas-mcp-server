@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict
 
 from eas_client import EASClient, FOLDER_TYPES
@@ -31,7 +31,7 @@ EAS_PROTOCOL = os.environ.get("EAS_PROTOCOL", "14.1")
 # Lifespan: initialize EAS client
 # ============================================================
 @asynccontextmanager
-async def app_lifespan():
+async def app_lifespan(server):
     """Initialize EAS client and sync folder list on startup."""
     if not EAS_USERNAME or not EAS_PASSWORD:
         raise ValueError(
@@ -45,6 +45,7 @@ async def app_lifespan():
         password=EAS_PASSWORD,
         device_id=EAS_DEVICE_ID,
         protocol_version=EAS_PROTOCOL,
+        email_address=EAS_EMAIL,
     )
 
     logger.info("Connecting to Exchange: %s as %s", EAS_HOST, EAS_USERNAME)
@@ -59,11 +60,29 @@ async def app_lifespan():
 # ============================================================
 # MCP Server
 # ============================================================
+_global_eas = None
 mcp = FastMCP("exchange_eas_mcp", lifespan=app_lifespan)
 
 
-def get_client(ctx) -> EASClient:
-    return ctx.request_context.lifespan_state["eas"]
+def get_client(ctx=None) -> EASClient:
+    if ctx:
+        try:
+            return ctx.request_context.lifespan_state["eas"]
+        except Exception:
+            pass
+    # Fallback: create/reuse global client
+    global _global_eas
+    if "_global_eas" not in globals() or _global_eas is None:
+        _global_eas = EASClient(
+            host=EAS_HOST,
+            username=EAS_USERNAME,
+            password=EAS_PASSWORD,
+            device_id=EAS_DEVICE_ID,
+            protocol_version=EAS_PROTOCOL,
+            email_address=EAS_EMAIL,
+        )
+        _global_eas.folder_sync()
+    return _global_eas
 
 
 # ============================================================
@@ -154,7 +173,7 @@ class SearchEmailInput(BaseModel):
         "openWorldHint": False,
     }
 )
-async def exchange_list_folders(params: ListFoldersInput, ctx=None) -> str:
+async def exchange_list_folders(folder_type: int = None, ctx: Context = None) -> str:
     """List all Exchange mailbox folders with their IDs and types.
 
     Returns folder name, ServerId (needed for other tools), type, and parent.
@@ -168,7 +187,7 @@ async def exchange_list_folders(params: ListFoldersInput, ctx=None) -> str:
     result = []
     for fid, f in sorted(client.folders.items(), key=lambda x: x[1].get("name", "")):
         ft = f.get("type", 0)
-        if params.folder_type is not None and ft != params.folder_type:
+        if folder_type is not None and ft != folder_type:
             continue
         result.append({
             "id": fid,
@@ -191,7 +210,7 @@ async def exchange_list_folders(params: ListFoldersInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
-async def exchange_get_emails(params: GetEmailsInput, ctx=None) -> str:
+async def exchange_get_emails(folder_id: str = None, max_items: int = 25, include_body: bool = False, ctx: Context = None) -> str:
     """Fetch emails from an Exchange mailbox folder.
 
     By default reads from Inbox. Returns subject, from, to, date, read status.
@@ -205,16 +224,16 @@ async def exchange_get_emails(params: GetEmailsInput, ctx=None) -> str:
     """
     client = get_client(ctx)
 
-    folder_id = params.folder_id
+    folder_id = folder_id
     if not folder_id:
         folder_id = client.find_folder(2)  # Inbox
         if not folder_id:
             return json.dumps({"error": "Inbox not found. Run exchange_list_folders first."})
 
-    body_size = "51200" if params.include_body else "0"
+    body_size = "51200" if include_body else "0"
     result = client.sync_folder(
         folder_id,
-        window_size=params.max_items,
+        window_size=max_items,
         body_type="1",
         body_size=body_size,
     )
@@ -230,7 +249,7 @@ async def exchange_get_emails(params: GetEmailsInput, ctx=None) -> str:
     emails = client.parse_emails(result["elements"])
 
     # Trim to max
-    emails = emails[:params.max_items]
+    emails = emails[:max_items]
 
     # Clean up for output
     output = []
@@ -247,7 +266,7 @@ async def exchange_get_emails(params: GetEmailsInput, ctx=None) -> str:
         if e.get("importance"):
             item["importance"] = {"0": "low", "1": "normal", "2": "high"}.get(
                 e["importance"], e["importance"])
-        if params.include_body and e.get("body"):
+        if include_body and e.get("body"):
             item["body"] = e["body"]
         if e.get("preview"):
             item["preview"] = e["preview"]
@@ -273,7 +292,7 @@ async def exchange_get_emails(params: GetEmailsInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
-async def exchange_get_calendar(params: GetCalendarInput, ctx=None) -> str:
+async def exchange_get_calendar(folder_id: str = None, max_items: int = 50, ctx: Context = None) -> str:
     """Fetch calendar events from Exchange.
 
     By default reads from the primary Calendar folder.
@@ -287,7 +306,7 @@ async def exchange_get_calendar(params: GetCalendarInput, ctx=None) -> str:
     """
     client = get_client(ctx)
 
-    folder_id = params.folder_id
+    folder_id = folder_id
     if not folder_id:
         folder_id = client.find_folder(8)  # Calendar
         if not folder_id:
@@ -295,7 +314,7 @@ async def exchange_get_calendar(params: GetCalendarInput, ctx=None) -> str:
 
     result = client.sync_folder(
         folder_id,
-        window_size=params.max_items,
+        window_size=max_items,
         body_type="1",
         body_size="1024",
     )
@@ -309,7 +328,7 @@ async def exchange_get_calendar(params: GetCalendarInput, ctx=None) -> str:
         }, ensure_ascii=False)
 
     events = client.parse_calendar(result["elements"])
-    events = events[:params.max_items]
+    events = events[:max_items]
 
     return json.dumps({
         "events": events,
@@ -329,7 +348,7 @@ async def exchange_get_calendar(params: GetCalendarInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
-async def exchange_get_contacts(params: GetContactsInput, ctx=None) -> str:
+async def exchange_get_contacts(folder_id: str = None, max_items: int = 100, ctx: Context = None) -> str:
     """Fetch contacts from Exchange address book.
 
     By default reads from the primary Contacts folder.
@@ -343,7 +362,7 @@ async def exchange_get_contacts(params: GetContactsInput, ctx=None) -> str:
     """
     client = get_client(ctx)
 
-    folder_id = params.folder_id
+    folder_id = folder_id
     if not folder_id:
         folder_id = client.find_folder(9)  # Contacts
         if not folder_id:
@@ -351,7 +370,7 @@ async def exchange_get_contacts(params: GetContactsInput, ctx=None) -> str:
 
     result = client.sync_folder(
         folder_id,
-        window_size=params.max_items,
+        window_size=max_items,
         body_type="1",
         body_size="256",
     )
@@ -365,7 +384,7 @@ async def exchange_get_contacts(params: GetContactsInput, ctx=None) -> str:
         }, ensure_ascii=False)
 
     contacts = client.parse_contacts(result["elements"])
-    contacts = contacts[:params.max_items]
+    contacts = contacts[:max_items]
 
     return json.dumps({
         "contacts": contacts,
@@ -385,7 +404,7 @@ async def exchange_get_contacts(params: GetContactsInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
-async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
+async def exchange_search_emails(query: str = "", folder_id: str = None, max_results: int = 20, ctx: Context = None) -> str:
     """Search emails by subject, sender, or content.
 
     Fetches emails from the specified folder and filters locally by query.
@@ -399,7 +418,7 @@ async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
     """
     client = get_client(ctx)
 
-    folder_id = params.folder_id
+    folder_id = folder_id
     if not folder_id:
         folder_id = client.find_folder(2)
         if not folder_id:
@@ -413,11 +432,11 @@ async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
     )
 
     if not result.get("elements"):
-        return json.dumps({"results": [], "count": 0, "query": params.query})
+        return json.dumps({"results": [], "count": 0, "query": query})
 
     emails = client.parse_emails(result["elements"])
 
-    q = params.query.lower()
+    q = query.lower()
     matches = []
     for e in emails:
         searchable = " ".join([
@@ -434,13 +453,13 @@ async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
                 "read": e.get("read", "0") == "1",
                 "preview": e.get("preview", "")[:200],
             })
-            if len(matches) >= params.max_results:
+            if len(matches) >= max_results:
                 break
 
     return json.dumps({
         "results": matches,
         "count": len(matches),
-        "query": params.query,
+        "query": query,
         "folder_id": folder_id,
     }, ensure_ascii=False, indent=2)
 
@@ -448,6 +467,119 @@ async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
 # ============================================================
 # Entry point
 # ============================================================
+
+
+@mcp.tool(
+    name="exchange_send_email",
+    annotations={
+        "title": "Send Email via Exchange",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def exchange_send_email(
+    to: str = "",
+    subject: str = "",
+    body: str = "",
+    cc: str = "",
+    content_type: str = "plain",
+    ctx: Context = None,
+) -> str:
+    """Send an email through Exchange.
+
+    Args:
+        to: Recipient email address (comma-separated for multiple)
+        subject: Email subject line
+        body: Email body text
+        cc: CC recipients (optional, comma-separated)
+        content_type: 'plain' for text or 'html' for HTML body
+
+    Returns:
+        JSON with send status
+    """
+    if not to or not subject:
+        return json.dumps({"error": "Both 'to' and 'subject' are required"})
+
+    client = get_client(ctx)
+    result = client.send_email(
+        to=to, subject=subject, body=body,
+        cc=cc, content_type=content_type,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="exchange_create_event",
+    annotations={
+        "title": "Create Calendar Event in Exchange",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+async def exchange_create_event(
+    subject: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    location: str = "",
+    body: str = "",
+    attendees: str = "",
+    all_day: bool = False,
+    reminder: int = 15,
+    ctx: Context = None,
+) -> str:
+    """Create a calendar event in Exchange.
+
+    Args:
+        subject: Event title
+        start_time: Start in ISO format, e.g. '2026-03-25T10:00:00.000Z'
+        end_time: End in ISO format, e.g. '2026-03-25T11:00:00.000Z'
+        location: Event location (optional)
+        body: Event description (optional)
+        attendees: Comma-separated emails, e.g. 'alice@co.com,bob@co.com' (optional)
+        all_day: Whether this is an all-day event (default false)
+        reminder: Reminder in minutes before event (default 15)
+
+    Returns:
+        JSON with creation status and server ID
+    """
+    if not subject or not start_time or not end_time:
+        return json.dumps({"error": "subject, start_time, and end_time are required"})
+
+    att_list = None
+    if attendees:
+        att_list = [{"email": e.strip(), "name": e.strip()} for e in attendees.split(",") if e.strip()]
+
+    client = get_client(ctx)
+    result = client.create_event(
+        subject=subject,
+        start_time=start_time,
+        end_time=end_time,
+        location=location,
+        body=body,
+        attendees=att_list,
+        all_day=all_day,
+        reminder=reminder,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+class RewriteHostMiddleware:
+    def __init__(self, app):
+        self.app = app
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            scope["headers"] = [
+                (b"host", b"localhost:8000") if k == b"host" else (k, v)
+                for k, v in scope.get("headers", [])
+            ]
+            scope["server"] = ("localhost", 8000)
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
     import sys
     if "--http" in sys.argv:
@@ -457,7 +589,7 @@ if __name__ == "__main__":
             if arg.startswith("--port="):
                 port = int(arg.split("=")[1])
         logger.info("Starting MCP server on HTTP 0.0.0.0:%d", port)
-        app = mcp.streamable_http_app()
+        app = RewriteHostMiddleware(mcp.streamable_http_app())
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")
