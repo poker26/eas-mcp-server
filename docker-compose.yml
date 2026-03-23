@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  eas-mcp:
+    build: .
+    container_name: eas-mcp-server
+    restart: unless-stopped
+    environment:
+      - EAS_HOST=mail.inplatlabs.ru
+      - EAS_USERNAME=${EAS_USERNAME}
+      - EAS_PASSWORD=${EAS_PASSWORD}
+      - EAS_DEVICE_ID=EAS0LEGCLIENT0001
+      - EAS_PROTOCOL=14.1
+    ports:
+      - "127.0.0.1:8900:8000"
+    # Uncomment labels below if using Traefik reverse proxy
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.eas-mcp.rule=Host(`eas-mcp.begemot26.ru`)"
+    #   - "traefik.http.routers.eas-mcp.entrypoints=websecure"
+    #   - "traefik.http.routers.eas-mcp.tls.certresolver=letsencrypt"
+    #   - "traefik.http.services.eas-mcp.loadbalancer.server.port=8000"
+    # networks:
+    #   - traefik
+
+# networks:
+#   traefik:
+#     external: true
