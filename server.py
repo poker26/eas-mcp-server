@@ -450,17 +450,15 @@ async def exchange_search_emails(params: SearchEmailInput, ctx=None) -> str:
 # ============================================================
 if __name__ == "__main__":
     import sys
-    transport = "stdio"
-    port = 8000
-    for arg in sys.argv[1:]:
-        if arg == "--http":
-            transport = "streamable_http"
-        elif arg.startswith("--port="):
-            port = int(arg.split("=")[1])
-
-    if transport == "streamable_http":
-        logger.info("Starting MCP server on HTTP port %d", port)
-        mcp.run(transport="streamable_http", port=port)
+    if "--http" in sys.argv:
+        import uvicorn
+        port = 8000
+        for arg in sys.argv[1:]:
+            if arg.startswith("--port="):
+                port = int(arg.split("=")[1])
+        logger.info("Starting MCP server on HTTP 0.0.0.0:%d", port)
+        app = mcp.streamable_http_app()
+        uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")
         mcp.run()
