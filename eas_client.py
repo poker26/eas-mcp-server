@@ -244,7 +244,8 @@ class EASClient:
                  device_id: str = "EAS0LEGCLIENT0001",
                  device_type: str = "EASClient",
                  protocol_version: str = "14.1",
-                 email_address: str = ""):
+                 email_address: str = "",
+                 state_file: str = ""):
         self.host = host
         self.url = f"https://{host}/Microsoft-Server-ActiveSync"
         self.username = username
@@ -259,6 +260,9 @@ class EASClient:
         )
         self.folders: dict = {}
         self.sync_keys: dict = {}
+        self.state_file = state_file or ""
+        if self.state_file:
+            self._load_state()
 
     def close(self):
         self.client.close()
@@ -284,6 +288,110 @@ class EASClient:
             if tag == tag_name and val is not None:
                 return val
         return None
+
+    # --- State persistence ---
+    def _load_state(self):
+        try:
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+                self.sync_keys = state.get("sync_keys", {})
+                logger.info("Loaded state: %d sync keys", len(self.sync_keys))
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.info("No existing state file, starting fresh")
+
+    def _save_state(self):
+        if not self.state_file:
+            return
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump({"sync_keys": self.sync_keys}, f)
+        except Exception as e:
+            logger.error("Failed to save state: %s", e)
+
+    # --- Incremental sync ---
+    def sync_incremental(self, collection_id: str, window_size: int = 50,
+                         body_type: str = "1", body_size: str = "51200") -> dict:
+        """Sync only new/changed items since last sync.
+
+        Uses stored SyncKey. On first call, drains all existing items
+        (without returning them) to establish baseline. Subsequent calls
+        return only new items.
+
+        Returns dict with status, sync_key, elements, is_initial.
+        """
+        stored_key = self.sync_keys.get(str(collection_id))
+
+        if not stored_key:
+            # First time: drain all existing items to establish baseline
+            logger.info("Initial sync for folder %s — draining existing items", collection_id)
+            r1 = self.sync(collection_id, "0")
+            key = r1.get("sync_key")
+            if not key:
+                return {"status": "error", "elements": [], "is_initial": True}
+
+            # Drain loop: keep syncing until no more items
+            total_drained = 0
+            while True:
+                r = self.sync(collection_id, key, window_size=500,
+                             body_type="1", body_size="0")
+                new_key = r.get("sync_key")
+                status = r.get("status")
+
+                if status == "no_changes" or not r.get("elements"):
+                    # Fully drained
+                    if new_key:
+                        key = new_key
+                    break
+
+                count = len([e for e in r.get("elements", []) if e[1] == "ServerId" and e[2]])
+                total_drained += count
+                if new_key:
+                    key = new_key
+
+                if count == 0:
+                    break
+
+            self.sync_keys[str(collection_id)] = key
+            self._save_state()
+            logger.info("Initial sync done for folder %s: drained %d items, key=%s",
+                       collection_id, total_drained, key)
+
+            return {
+                "status": "initial_sync_done",
+                "sync_key": key,
+                "elements": [],
+                "is_initial": True,
+                "drained": total_drained,
+            }
+
+        # Incremental: use stored key — only new items
+        r = self.sync(collection_id, stored_key, window_size=window_size,
+                     body_type=body_type, body_size=body_size)
+
+        new_key = r.get("sync_key")
+        status = r.get("status")
+
+        if status == "no_changes":
+            return {"status": "no_changes", "sync_key": stored_key,
+                    "elements": [], "is_initial": False}
+
+        if new_key:
+            self.sync_keys[str(collection_id)] = new_key
+            self._save_state()
+
+        # Handle invalid sync key (server reset)
+        if status in ("3", "12"):
+            logger.warning("SyncKey invalid, resetting for folder %s", collection_id)
+            del self.sync_keys[str(collection_id)]
+            self._save_state()
+            return self.sync_incremental(collection_id, window_size, body_type, body_size)
+
+        return {
+            "status": status,
+            "sync_key": new_key,
+            "elements": r.get("elements", []),
+            "is_initial": False,
+        }
 
     # --- FolderSync ---
     def folder_sync(self) -> dict:

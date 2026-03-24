@@ -26,6 +26,7 @@ EAS_PASSWORD = os.environ.get("EAS_PASSWORD", "")
 EAS_DEVICE_ID = os.environ.get("EAS_DEVICE_ID", "EAS0LEGCLIENT0001")
 EAS_PROTOCOL = os.environ.get("EAS_PROTOCOL", "14.1")
 EAS_EMAIL = os.environ.get("EAS_EMAIL", "")
+STATE_FILE = os.environ.get("STATE_FILE", "/app/eas_state.json")
 API_KEY = os.environ.get("API_KEY", "")
 
 
@@ -48,6 +49,7 @@ async def app_lifespan(server):
         device_id=EAS_DEVICE_ID,
         protocol_version=EAS_PROTOCOL,
         email_address=EAS_EMAIL,
+        state_file=STATE_FILE,
     )
 
     logger.info("Connecting to Exchange: %s as %s", EAS_HOST, EAS_USERNAME)
@@ -82,6 +84,7 @@ def get_client(ctx=None) -> EASClient:
             device_id=EAS_DEVICE_ID,
             protocol_version=EAS_PROTOCOL,
             email_address=EAS_EMAIL,
+            state_file=STATE_FILE,
         )
         _global_eas.folder_sync()
     return _global_eas
@@ -673,6 +676,47 @@ async def api_create_event(
     return result
 
 
+@api.get("/api/new_emails", tags=["Email"], summary="Get new emails (incremental)")
+async def api_new_emails(
+    folder_id: Optional[str] = Query(None, description="Folder ServerId (default: Inbox)"),
+    max: int = Query(50, ge=1, le=200, description="Maximum emails"),
+    body: bool = Query(True, description="Include email body"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Get only NEW emails since last check. First call returns all current emails."""
+    _verify_key(x_api_key, authorization)
+    c = _rest_client()
+    fid = folder_id or c.find_folder(2)
+    body_size = "51200" if body else "0"
+    result = c.sync_incremental(fid, window_size=max, body_type="1", body_size=body_size)
+    emails = c.parse_emails(result.get("elements", []))
+    output = []
+    for e in emails:
+        item = {"subject": e.get("subject",""), "from": e.get("from",""), "to": e.get("to",""), "date": e.get("date",""), "read": e.get("read","0") == "1"}
+        if e.get("cc"): item["cc"] = e["cc"]
+        if body and e.get("body"): item["body"] = e["body"]
+        if e.get("preview"): item["preview"] = e["preview"]
+        output.append(item)
+    return {"emails": output, "count": len(output), "is_initial": result.get("is_initial", False)}
+
+
+@api.get("/api/new_events", tags=["Calendar"], summary="Get new/changed events (incremental)")
+async def api_new_events(
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    max: int = Query(50, ge=1, le=200, description="Maximum events"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Get only NEW or CHANGED calendar events since last check."""
+    _verify_key(x_api_key, authorization)
+    c = _rest_client()
+    fid = folder_id or c.find_folder(8)
+    result = c.sync_incremental(fid, window_size=max, body_type="1", body_size="4096")
+    events = c.parse_calendar(result.get("elements", []))
+    return {"events": events, "count": len(events), "is_initial": result.get("is_initial", False)}
+
+
 @api.get("/api/attachment", tags=["Email"], summary="Download attachment")
 async def api_get_attachment(
     file_reference: str = Query(..., description="FileReference from email attachment metadata"),
@@ -722,6 +766,119 @@ async def exchange_get_attachment(
     client = get_client(ctx)
     result = client.get_attachment(file_reference)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="exchange_get_new_emails",
+    annotations={
+        "title": "Get New Emails (Incremental)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+async def exchange_get_new_emails(
+    folder_id: str = None,
+    max_items: int = 50,
+    include_body: bool = True,
+    ctx: Context = None,
+) -> str:
+    """Get only NEW emails since last check. Uses stored SyncKey.
+
+    First call returns all current emails and stores the sync position.
+    Subsequent calls return only new emails that arrived since last check.
+
+    Args:
+        folder_id: Folder ServerId (default: Inbox)
+        max_items: Maximum emails to return
+        include_body: Include email body text (default: true for new emails)
+
+    Returns:
+        JSON with new emails, count, and is_initial flag
+    """
+    client = get_client(ctx)
+    fid = folder_id or client.find_folder(2)
+    if not fid:
+        return json.dumps({"error": "Inbox not found"})
+
+    body_size = "51200" if include_body else "0"
+    result = client.sync_incremental(
+        fid, window_size=max_items,
+        body_type="1", body_size=body_size,
+    )
+
+    emails = client.parse_emails(result.get("elements", []))
+
+    output = []
+    for e in emails:
+        item = {
+            "subject": e.get("subject", ""),
+            "from": e.get("from", ""),
+            "to": e.get("to", ""),
+            "date": e.get("date", ""),
+            "read": e.get("read", "0") == "1",
+        }
+        if e.get("cc"): item["cc"] = e["cc"]
+        if include_body and e.get("body"): item["body"] = e["body"]
+        if e.get("preview"): item["preview"] = e["preview"]
+        output.append(item)
+
+    return json.dumps({
+        "emails": output,
+        "count": len(output),
+        "is_initial": result.get("is_initial", False),
+        "status": result.get("status"),
+        "folder_id": fid,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="exchange_get_new_events",
+    annotations={
+        "title": "Get New/Changed Calendar Events (Incremental)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+async def exchange_get_new_events(
+    folder_id: str = None,
+    max_items: int = 50,
+    ctx: Context = None,
+) -> str:
+    """Get only NEW or CHANGED calendar events since last check.
+
+    First call returns all current events and stores sync position.
+    Subsequent calls return only new/changed/deleted events.
+
+    Args:
+        folder_id: Calendar folder ServerId (default: Calendar)
+        max_items: Maximum events to return
+
+    Returns:
+        JSON with new events, count, and is_initial flag
+    """
+    client = get_client(ctx)
+    fid = folder_id or client.find_folder(8)
+    if not fid:
+        return json.dumps({"error": "Calendar not found"})
+
+    result = client.sync_incremental(
+        fid, window_size=max_items,
+        body_type="1", body_size="4096",
+    )
+
+    events = client.parse_calendar(result.get("elements", []))
+
+    return json.dumps({
+        "events": events,
+        "count": len(events),
+        "is_initial": result.get("is_initial", False),
+        "status": result.get("status"),
+        "folder_id": fid,
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
