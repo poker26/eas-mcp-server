@@ -844,9 +844,25 @@ if __name__ == "__main__":
             if arg.startswith("--port="):
                 port = int(arg.split("=")[1])
         logger.info("Starting MCP server on HTTP 0.0.0.0:%d", port)
-        mcp_app = RewriteHostMiddleware(mcp.streamable_http_app())
-        api.mount("/mcp", mcp_app)
-        app = api
+        mcp_asgi = mcp.streamable_http_app()
+        mcp_wrapped = RewriteHostMiddleware(mcp_asgi)
+
+        class CombinedApp:
+            def __init__(self, mcp_app, rest_app):
+                self.mcp = mcp_app
+                self.rest = rest_app
+            async def __call__(self, scope, receive, send):
+                if scope["type"] == "lifespan":
+                    # Forward lifespan to MCP app (it needs startup/shutdown)
+                    await self.mcp(scope, receive, send)
+                    return
+                path = scope.get("path", "")
+                if path.startswith("/mcp"):
+                    await self.mcp(scope, receive, send)
+                else:
+                    await self.rest(scope, receive, send)
+
+        app = CombinedApp(mcp_wrapped, api)
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")
