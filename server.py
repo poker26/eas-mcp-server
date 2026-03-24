@@ -467,10 +467,21 @@ async def exchange_search_emails(query: str = "", folder_id: str = None, max_res
 
 
 # ============================================================
-# REST API (for n8n HTTP Request, curl, any HTTP client)
+# REST API with FastAPI (Swagger UI at /docs)
 # ============================================================
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel as PydanticBase, Field as PydField
+from typing import Optional, List
+
+api = FastAPI(
+    title="Exchange ActiveSync API",
+    description="REST API for accessing Microsoft Exchange via ActiveSync protocol. "
+                "Provides email, calendar, contacts access and search.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 _rest_eas = None
 
@@ -489,181 +500,190 @@ def _rest_client():
     return _rest_eas
 
 
-def _check_api_key(request: Request):
+def _verify_key(x_api_key: str = Header(default=None), authorization: str = Header(default=None)):
     if not API_KEY:
-        return True
-    auth = request.headers.get("authorization", "")
-    key = request.headers.get("x-api-key", "")
-    return auth == f"Bearer {API_KEY}" or key == API_KEY
+        return
+    token = None
+    if x_api_key:
+        token = x_api_key
+    elif authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+    if token != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key. Use X-API-Key header.")
 
 
-async def api_health(request: Request):
-    return JSONResponse({"status": "ok", "host": EAS_HOST, "device_id": EAS_DEVICE_ID})
+# --- Models for Swagger ---
+class SendEmailRequest(PydanticBase):
+    to: str = PydField(..., description="Recipient email. Comma-separated for multiple", example="alice@company.com")
+    subject: str = PydField(..., description="Email subject", example="Meeting tomorrow")
+    body: str = PydField("", description="Email body text")
+    cc: str = PydField("", description="CC recipients, comma-separated")
+    content_type: str = PydField("plain", description="'plain' or 'html'")
+
+class CreateEventRequest(PydanticBase):
+    subject: str = PydField(..., description="Event title", example="Team standup")
+    start_time: str = PydField(..., description="Start time ISO format UTC", example="2026-03-25T10:00:00Z")
+    end_time: str = PydField(..., description="End time ISO format UTC", example="2026-03-25T11:00:00Z")
+    location: str = PydField("", description="Event location")
+    body: str = PydField("", description="Event description")
+    attendees: str = PydField("", description="Comma-separated emails", example="alice@co.com,bob@co.com")
+    all_day: bool = PydField(False, description="All-day event")
+    reminder: int = PydField(15, description="Reminder in minutes before event")
 
 
-async def api_folders(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+# --- Endpoints ---
+@api.get("/api/health", tags=["System"], summary="Health check")
+async def api_health():
+    """Check server status. No authentication required."""
+    return {"status": "ok", "host": EAS_HOST, "device_id": EAS_DEVICE_ID}
+
+
+@api.get("/api/folders", tags=["Mailbox"], summary="List folders")
+async def api_folders(
+    type: Optional[int] = Query(None, description="Filter by folder type: 2=Inbox, 3=Drafts, 4=Deleted, 5=Sent, 7=Tasks, 8=Calendar, 9=Contacts"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """List all mailbox folders with IDs and types."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
     if not c.folders:
         c.folder_sync()
-    ft = request.query_params.get("type")
     result = []
     for fid, f in sorted(c.folders.items(), key=lambda x: x[1].get("name", "")):
         t = f.get("type", 0)
-        if ft is not None and t != int(ft):
+        if type is not None and t != type:
             continue
-        result.append({
-            "id": fid, "name": f.get("name", ""),
-            "type": t, "type_name": FOLDER_TYPES.get(t, f"Type {t}"),
-        })
-    return JSONResponse({"folders": result, "count": len(result)})
+        result.append({"id": fid, "name": f.get("name", ""), "type": t, "type_name": FOLDER_TYPES.get(t, f"Type {t}")})
+    return {"folders": result, "count": len(result)}
 
 
-async def api_emails(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+@api.get("/api/emails", tags=["Email"], summary="Get emails")
+async def api_emails(
+    folder_id: Optional[str] = Query(None, description="Folder ServerId (default: Inbox)"),
+    max: int = Query(25, ge=1, le=100, description="Maximum emails to return"),
+    body: bool = Query(False, description="Include email body text"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Fetch emails from a mailbox folder. Default is Inbox."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    folder_id = request.query_params.get("folder_id") or c.find_folder(2)
-    max_items = int(request.query_params.get("max", "25"))
-    include_body = request.query_params.get("body", "false").lower() == "true"
-
-    body_size = "51200" if include_body else "0"
-    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size=body_size)
-    emails = c.parse_emails(r.get("elements", []))[:max_items]
-
+    fid = folder_id or c.find_folder(2)
+    body_size = "51200" if body else "0"
+    r = c.sync_folder(fid, window_size=max, body_type="1", body_size=body_size)
+    emails = c.parse_emails(r.get("elements", []))[:max]
     output = []
     for e in emails:
-        item = {
-            "subject": e.get("subject", ""),
-            "from": e.get("from", ""),
-            "to": e.get("to", ""),
-            "date": e.get("date", ""),
-            "read": e.get("read", "0") == "1",
-        }
+        item = {"subject": e.get("subject", ""), "from": e.get("from", ""), "to": e.get("to", ""), "date": e.get("date", ""), "read": e.get("read", "0") == "1"}
         if e.get("cc"): item["cc"] = e["cc"]
-        if include_body and e.get("body"): item["body"] = e["body"]
+        if body and e.get("body"): item["body"] = e["body"]
         if e.get("preview"): item["preview"] = e["preview"]
         output.append(item)
-    return JSONResponse({"emails": output, "count": len(output)})
+    return {"emails": output, "count": len(output)}
 
 
-async def api_search(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+@api.get("/api/search", tags=["Email"], summary="Search emails")
+async def api_search(
+    q: str = Query(..., min_length=1, description="Search query (matches subject, from, to, body)"),
+    folder_id: Optional[str] = Query(None, description="Folder to search (default: Inbox)"),
+    max: int = Query(20, ge=1, le=50, description="Maximum results"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Search emails by subject, sender, or content. Case-insensitive."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    q = request.query_params.get("q", "")
-    if not q:
-        return JSONResponse({"error": "query parameter q is required"}, status_code=400)
-    folder_id = request.query_params.get("folder_id") or c.find_folder(2)
-    max_results = int(request.query_params.get("max", "20"))
-
-    r = c.sync_folder(folder_id, window_size=200, body_type="1", body_size="1024")
+    fid = folder_id or c.find_folder(2)
+    r = c.sync_folder(fid, window_size=200, body_type="1", body_size="1024")
     emails = c.parse_emails(r.get("elements", []))
     ql = q.lower()
     matches = []
     for e in emails:
         text = " ".join([e.get("subject",""), e.get("from",""), e.get("to",""), e.get("preview",""), e.get("body","")]).lower()
         if ql in text:
-            matches.append({
-                "subject": e.get("subject", ""), "from": e.get("from", ""),
-                "date": e.get("date", ""), "read": e.get("read", "0") == "1",
-            })
-            if len(matches) >= max_results:
+            matches.append({"subject": e.get("subject",""), "from": e.get("from",""), "date": e.get("date",""), "read": e.get("read","0") == "1"})
+            if len(matches) >= max:
                 break
-    return JSONResponse({"results": matches, "count": len(matches), "query": q})
+    return {"results": matches, "count": len(matches), "query": q}
 
 
-async def api_calendar(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+@api.get("/api/calendar", tags=["Calendar"], summary="Get calendar events")
+async def api_calendar(
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    max: int = Query(50, ge=1, le=200, description="Maximum events"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Fetch calendar events. Default is primary Calendar folder."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    folder_id = request.query_params.get("folder_id") or c.find_folder(8)
-    max_items = int(request.query_params.get("max", "50"))
-
-    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size="1024")
-    events = c.parse_calendar(r.get("elements", []))[:max_items]
-    return JSONResponse({"events": events, "count": len(events)})
+    fid = folder_id or c.find_folder(8)
+    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="1024")
+    events = c.parse_calendar(r.get("elements", []))[:max]
+    return {"events": events, "count": len(events)}
 
 
-async def api_contacts(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+@api.get("/api/contacts", tags=["Contacts"], summary="Get contacts")
+async def api_contacts(
+    folder_id: Optional[str] = Query(None, description="Contacts folder ServerId"),
+    max: int = Query(100, ge=1, le=500, description="Maximum contacts"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Fetch contacts from address book. Default is primary Contacts folder."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    folder_id = request.query_params.get("folder_id") or c.find_folder(9)
-    max_items = int(request.query_params.get("max", "100"))
-
-    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size="256")
-    contacts = c.parse_contacts(r.get("elements", []))[:max_items]
-    return JSONResponse({"contacts": contacts, "count": len(contacts)})
+    fid = folder_id or c.find_folder(9)
+    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="256")
+    contacts = c.parse_contacts(r.get("elements", []))[:max]
+    return {"contacts": contacts, "count": len(contacts)}
 
 
-async def api_send_email(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    to = data.get("to", "")
-    subject = data.get("subject", "")
-    if not to or not subject:
-        return JSONResponse({"error": "to and subject are required"}, status_code=400)
-
+@api.post("/api/send", tags=["Email"], summary="Send email")
+async def api_send_email(
+    data: SendEmailRequest,
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Send an email via Exchange. Supports plain text and HTML."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    result = c.send_email(
-        to=to, subject=subject,
-        body=data.get("body", ""),
-        cc=data.get("cc", ""),
-        content_type=data.get("content_type", "plain"),
-    )
-    return JSONResponse(result)
+    result = c.send_email(to=data.to, subject=data.subject, body=data.body, cc=data.cc, content_type=data.content_type)
+    return result
 
 
-async def api_create_event(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    subject = data.get("subject", "")
-    start_time = data.get("start_time", "")
-    end_time = data.get("end_time", "")
-    if not subject or not start_time or not end_time:
-        return JSONResponse({"error": "subject, start_time, end_time are required"}, status_code=400)
-
+@api.post("/api/event", tags=["Calendar"], summary="Create calendar event")
+async def api_create_event(
+    data: CreateEventRequest,
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Create a calendar event. Times must be in UTC (Z suffix). Moscow = UTC+3."""
+    _verify_key(x_api_key, authorization)
+    c = _rest_client()
     attendees = None
-    att_str = data.get("attendees", "")
-    if att_str:
-        if isinstance(att_str, list):
-            attendees = att_str
-        else:
-            attendees = [{"email": e.strip(), "name": e.strip()} for e in att_str.split(",") if e.strip()]
-
-    c = _rest_client()
+    if data.attendees:
+        attendees = [{"email": e.strip(), "name": e.strip()} for e in data.attendees.split(",") if e.strip()]
     result = c.create_event(
-        subject=subject, start_time=start_time, end_time=end_time,
-        location=data.get("location", ""),
-        body=data.get("body", ""),
-        attendees=attendees,
-        all_day=data.get("all_day", False),
-        reminder=data.get("reminder", 15),
+        subject=data.subject, start_time=data.start_time, end_time=data.end_time,
+        location=data.location, body=data.body, attendees=attendees,
+        all_day=data.all_day, reminder=data.reminder,
     )
-    return JSONResponse(result)
+    return result
 
 
-async def api_get_attachment(request: Request):
-    if not _check_api_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    ref = request.query_params.get("file_reference", "")
-    if not ref:
-        return JSONResponse({"error": "file_reference parameter is required"}, status_code=400)
+@api.get("/api/attachment", tags=["Email"], summary="Download attachment")
+async def api_get_attachment(
+    file_reference: str = Query(..., description="FileReference from email attachment metadata"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Download an email attachment by FileReference. Returns base64-encoded data."""
+    _verify_key(x_api_key, authorization)
     c = _rest_client()
-    result = c.get_attachment(ref)
-    return JSONResponse(result)
+    result = c.get_attachment(file_reference)
+    return result
 
 
 # ============================================================
@@ -824,25 +844,9 @@ if __name__ == "__main__":
             if arg.startswith("--port="):
                 port = int(arg.split("=")[1])
         logger.info("Starting MCP server on HTTP 0.0.0.0:%d", port)
-        from starlette.applications import Starlette
-        from starlette.routing import Route, Mount
-
         mcp_app = RewriteHostMiddleware(mcp.streamable_http_app())
-
-        rest_routes = [
-            Route("/api/health", api_health, methods=["GET"]),
-            Route("/api/folders", api_folders, methods=["GET"]),
-            Route("/api/emails", api_emails, methods=["GET"]),
-            Route("/api/search", api_search, methods=["GET"]),
-            Route("/api/calendar", api_calendar, methods=["GET"]),
-            Route("/api/contacts", api_contacts, methods=["GET"]),
-            Route("/api/send", api_send_email, methods=["POST"]),
-            Route("/api/event", api_create_event, methods=["POST"]),
-            Route("/api/attachment", api_get_attachment, methods=["GET"]),
-            Mount("/mcp", app=mcp_app),
-        ]
-
-        app = Starlette(routes=rest_routes)
+        api.mount("/mcp", mcp_app)
+        app = api
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")

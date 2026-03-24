@@ -2,6 +2,15 @@
 
 Reference for all MCP tools available through the n8n MCP Client node.
 
+## Interactive API Docs
+
+Before configuring n8n, you can explore all available endpoints in the browser:
+
+- **Swagger UI**: `http://<SERVER_IP>:8900/docs`
+- **ReDoc**: `http://<SERVER_IP>:8900/redoc`
+
+You can test any endpoint directly from Swagger UI by clicking "Authorize" and entering your API key.
+
 ## Connection Setup
 
 In n8n MCP Client node:
