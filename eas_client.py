@@ -102,9 +102,19 @@ CP_AIRSYNCBASE = {
     0x19: "Preview",
 }
 
+# Page 14: ItemOperations
+CP_ITEMOPS = {
+    0x05: "ItemOperations", 0x06: "Fetch", 0x07: "Store",
+    0x08: "Options", 0x09: "Range", 0x0A: "Total",
+    0x0B: "Properties", 0x0C: "Data", 0x0D: "Status",
+    0x0E: "Response", 0x0F: "Version", 0x10: "Schema",
+    0x11: "Part", 0x12: "EmptyFolderContents",
+    0x13: "DeleteSubFolders",
+}
+
 ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
-    4: CP_CALENDAR, 7: CP_FOLDER, 17: CP_AIRSYNCBASE,
+    4: CP_CALENDAR, 7: CP_FOLDER, 14: CP_ITEMOPS, 17: CP_AIRSYNCBASE,
 }
 
 FOLDER_TYPES = {
@@ -382,6 +392,9 @@ class EASClient:
                     "Read": "read", "MessageClass": "class",
                     "Data": "body", "Preview": "preview",
                     "EstimatedDataSize": "size", "ThreadTopic": "thread_topic",
+                    "FileReference": "file_reference",
+                    "DisplayName": "att_display_name",
+                    "AttName": "att_name",
                 }
                 if tag in mapping:
                     cur[mapping[tag]] = value
@@ -442,6 +455,53 @@ class EASClient:
         if cur.get("FileAs") or cur.get("FirstName"):
             contacts.append(cur)
         return contacts
+
+    # --- Get Attachment ---
+    def get_attachment(self, file_reference: str) -> dict:
+        """Download an attachment by FileReference.
+
+        Args:
+            file_reference: The FileReference from email attachment metadata
+
+        Returns:
+            dict with 'data' (base64), 'content_type', 'status'
+        """
+        import base64 as b64module
+
+        enc = WBXMLEncoder()
+        # <ItemOperations> page 14, tag 0x05
+        enc.tag_open(14, 0x05)
+        # <Fetch> tag 0x06
+        enc.tag_open(14, 0x06)
+        # <Store> tag 0x07
+        enc.tag_str(14, 0x07, "Mailbox")
+        # <FileReference> - AirSyncBase page 17, tag 0x11
+        enc.tag_str(17, 0x11, file_reference)
+        enc.end()  # Fetch
+        enc.end()  # ItemOperations
+
+        resp = self._post("ItemOperations", enc.get())
+
+        if resp.status_code == 200 and resp.content:
+            elements = self._decode(resp)
+            status = self._find(elements, "Status")
+            data = None
+            content_type = None
+            for _, tag, val in elements:
+                if tag == "Data" and val:
+                    data = val
+                if tag == "ContentType" and val:
+                    content_type = val
+
+            if status == "1" and data:
+                return {
+                    "status": "ok",
+                    "data": data,
+                    "content_type": content_type,
+                    "file_reference": file_reference,
+                }
+            return {"status": f"error_{status}"}
+        return {"status": f"HTTP {resp.status_code}"}
 
     # --- SendMail ---
     def send_email(self, to: str, subject: str, body: str,
@@ -527,80 +587,82 @@ class EASClient:
         
         Args:
             subject: Event title
-            start_time: ISO format e.g. '2026-03-25T10:00:00.000Z'
-            end_time: ISO format e.g. '2026-03-25T11:00:00.000Z'
+            start_time: ISO format e.g. '2026-03-25T10:00:00Z' or '20260325T100000Z'
+            end_time: ISO format e.g. '2026-03-25T11:00:00Z' or '20260325T110000Z'
             location: Event location (optional)
             body: Event description (optional)
             attendees: List of dicts [{"email": "...", "name": "..."}] (optional)
-            all_day: Whether it's an all-day event
+            all_day: Whether it is an all-day event
             reminder: Reminder in minutes (default 15)
         
         Returns:
             dict with status and server_id
         """
-        cal_id = self.find_folder(8)  # Calendar
+        cal_id = self.find_folder(8)
         if not cal_id:
             return {"status": "error", "message": "Calendar folder not found"}
 
-        # Get sync key first
+        # Convert ISO dates to EAS compact format: 20260325T100000Z
+        def to_eas_date(s):
+            s = s.replace("-", "").replace(":", "").replace(".000", "")
+            if not s.endswith("Z"):
+                s += "Z"
+            return s
+
+        eas_start = to_eas_date(start_time)
+        eas_end = to_eas_date(end_time)
+        eas_stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+        # UTC timezone blob (all zeros = UTC)
+        # This is a 172-byte base64-encoded TIME_ZONE_INFORMATION structure
+        import base64
+        utc_tz = base64.b64encode(b"\x00" * 172).decode()
+
+        # Step 1: get sync key
         r1 = self.sync(cal_id, "0")
         sync_key = r1.get("sync_key")
         if not sync_key:
             return {"status": "error", "message": "Failed to get SyncKey"}
 
+        # Step 2: full sync to advance key
+        r2 = self.sync(cal_id, sync_key, window_size=1)
+        sync_key2 = r2.get("sync_key") or sync_key
+
         client_id = str(uuid.uuid4())[:8]
 
         enc = WBXMLEncoder()
-        # <Sync> page 0
-        enc.tag_open(0, 0x05)
-        # <Collections>
-        enc.tag_open(0, 0x1C)
-        # <Collection>
-        enc.tag_open(0, 0x0F)
-        # <SyncKey>
-        enc.tag_str(0, 0x0B, sync_key)
-        # <CollectionId>
+        enc.tag_open(0, 0x05)   # Sync
+        enc.tag_open(0, 0x1C)   # Collections
+        enc.tag_open(0, 0x0F)   # Collection
+        enc.tag_str(0, 0x0B, sync_key2)
         enc.tag_str(0, 0x12, str(cal_id))
-        # <Commands>
-        enc.tag_open(0, 0x16)
-        # <Add>
-        enc.tag_open(0, 0x07)
-        # <ClientId>
+        enc.tag_open(0, 0x16)   # Commands
+        enc.tag_open(0, 0x07)   # Add
         enc.tag_str(0, 0x0C, client_id)
-        # <ApplicationData>
-        enc.tag_open(0, 0x1D)
+        enc.tag_open(0, 0x1D)   # ApplicationData
 
         # Calendar fields - page 4
-        # <Subject>
-        enc.tag_str(4, 0x26, subject)
-        # <StartTime>
-        enc.tag_str(4, 0x27, start_time)
-        # <EndTime>
-        enc.tag_str(4, 0x12, end_time)
-        # <Location>
+        enc.tag_str(4, 0x05, utc_tz)        # TimeZone (required!)
+        enc.tag_str(4, 0x06, "1" if all_day else "0")  # AllDayEvent
+        enc.tag_str(4, 0x0D, "2")           # BusyStatus = Busy
+        enc.tag_str(4, 0x11, eas_stamp)     # DtStamp
+        enc.tag_str(4, 0x12, eas_end)       # EndTime
+        enc.tag_str(4, 0x25, "0")           # Sensitivity = Normal
+        enc.tag_str(4, 0x26, subject)       # Subject
+        enc.tag_str(4, 0x27, eas_start)     # StartTime
+        enc.tag_str(4, 0x28, str(uuid.uuid4()))  # UID
+        enc.tag_str(4, 0x18, "1" if attendees else "0")  # MeetingStatus
+        enc.tag_str(4, 0x24, str(reminder)) # Reminder
+
         if location:
             enc.tag_str(4, 0x17, location)
-        # <AllDayEvent>
-        enc.tag_str(4, 0x06, "1" if all_day else "0")
-        # <BusyStatus> 2=Busy
-        enc.tag_str(4, 0x0D, "2")
-        # <MeetingStatus> 1=Meeting
-        enc.tag_str(4, 0x18, "1" if attendees else "0")
-        # <Reminder>
-        enc.tag_str(4, 0x24, str(reminder))
-        # <Sensitivity> 0=Normal
-        enc.tag_str(4, 0x25, "0")
-        # <DtStamp>
-        enc.tag_str(4, 0x11, datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
-        # <UID>
-        enc.tag_str(4, 0x28, str(uuid.uuid4()))
 
         # Body - AirSyncBase page 17
         if body:
             enc.tag_open(17, 0x0A)  # Body
             enc.tag_str(17, 0x06, "1")  # Type = plain text
             enc.tag_str(17, 0x0B, body)  # Data
-            enc.end()  # Body
+            enc.end()
 
         # Attendees
         if attendees:
@@ -609,10 +671,10 @@ class EASClient:
                 enc.tag_open(4, 0x08)  # Attendee
                 enc.tag_str(4, 0x09, att.get("email", ""))
                 enc.tag_str(4, 0x0A, att.get("name", att.get("email", "")))
-                enc.tag_str(4, 0x2A, "1")  # Type=Required
-                enc.tag_str(4, 0x29, "0")  # Status=None
-                enc.end()  # Attendee
-            enc.end()  # Attendees
+                enc.tag_str(4, 0x2A, "1")  # Type = Required
+                enc.tag_str(4, 0x29, "0")  # Status = None
+                enc.end()
+            enc.end()
 
         enc.end()  # ApplicationData
         enc.end()  # Add
@@ -626,13 +688,22 @@ class EASClient:
         if resp.status_code == 200 and resp.content:
             elements = self._decode(resp)
             status = self._find(elements, "Status")
-            server_id = self._find(elements, "ServerId")
-            return {
-                "status": "created" if status == "1" else f"error_{status}",
-                "server_id": server_id,
-                "client_id": client_id,
-            }
+            server_id = None
+            # Find ServerId in Responses section
+            in_responses = False
+            for _, tag, val in elements:
+                if tag == "Responses":
+                    in_responses = True
+                if in_responses and tag == "Status" and val:
+                    status = val
+                if in_responses and tag == "ServerId" and val:
+                    server_id = val
+
+            if status == "1":
+                return {"status": "created", "server_id": server_id, "client_id": client_id}
+            else:
+                return {"status": f"error_{status}", "client_id": client_id}
         elif resp.status_code == 200:
-            return {"status": "created", "client_id": client_id}
+            return {"status": "created_empty_response", "client_id": client_id}
         else:
             return {"status": f"HTTP {resp.status_code}"}

@@ -26,6 +26,7 @@ EAS_PASSWORD = os.environ.get("EAS_PASSWORD", "")
 EAS_DEVICE_ID = os.environ.get("EAS_DEVICE_ID", "EAS0LEGCLIENT0001")
 EAS_PROTOCOL = os.environ.get("EAS_PROTOCOL", "14.1")
 EAS_EMAIL = os.environ.get("EAS_EMAIL", "")
+API_KEY = os.environ.get("API_KEY", "")
 
 
 # ============================================================
@@ -466,8 +467,241 @@ async def exchange_search_emails(query: str = "", folder_id: str = None, max_res
 
 
 # ============================================================
+# REST API (for n8n HTTP Request, curl, any HTTP client)
+# ============================================================
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+_rest_eas = None
+
+def _rest_client():
+    global _rest_eas
+    if _rest_eas is None:
+        _rest_eas = EASClient(
+            host=EAS_HOST,
+            username=EAS_USERNAME,
+            password=EAS_PASSWORD,
+            device_id=EAS_DEVICE_ID,
+            protocol_version=EAS_PROTOCOL,
+            email_address=EAS_EMAIL,
+        )
+        _rest_eas.folder_sync()
+    return _rest_eas
+
+
+def _check_api_key(request: Request):
+    if not API_KEY:
+        return True
+    auth = request.headers.get("authorization", "")
+    key = request.headers.get("x-api-key", "")
+    return auth == f"Bearer {API_KEY}" or key == API_KEY
+
+
+async def api_health(request: Request):
+    return JSONResponse({"status": "ok", "host": EAS_HOST, "device_id": EAS_DEVICE_ID})
+
+
+async def api_folders(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    c = _rest_client()
+    if not c.folders:
+        c.folder_sync()
+    ft = request.query_params.get("type")
+    result = []
+    for fid, f in sorted(c.folders.items(), key=lambda x: x[1].get("name", "")):
+        t = f.get("type", 0)
+        if ft is not None and t != int(ft):
+            continue
+        result.append({
+            "id": fid, "name": f.get("name", ""),
+            "type": t, "type_name": FOLDER_TYPES.get(t, f"Type {t}"),
+        })
+    return JSONResponse({"folders": result, "count": len(result)})
+
+
+async def api_emails(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    c = _rest_client()
+    folder_id = request.query_params.get("folder_id") or c.find_folder(2)
+    max_items = int(request.query_params.get("max", "25"))
+    include_body = request.query_params.get("body", "false").lower() == "true"
+
+    body_size = "51200" if include_body else "0"
+    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size=body_size)
+    emails = c.parse_emails(r.get("elements", []))[:max_items]
+
+    output = []
+    for e in emails:
+        item = {
+            "subject": e.get("subject", ""),
+            "from": e.get("from", ""),
+            "to": e.get("to", ""),
+            "date": e.get("date", ""),
+            "read": e.get("read", "0") == "1",
+        }
+        if e.get("cc"): item["cc"] = e["cc"]
+        if include_body and e.get("body"): item["body"] = e["body"]
+        if e.get("preview"): item["preview"] = e["preview"]
+        output.append(item)
+    return JSONResponse({"emails": output, "count": len(output)})
+
+
+async def api_search(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    c = _rest_client()
+    q = request.query_params.get("q", "")
+    if not q:
+        return JSONResponse({"error": "query parameter q is required"}, status_code=400)
+    folder_id = request.query_params.get("folder_id") or c.find_folder(2)
+    max_results = int(request.query_params.get("max", "20"))
+
+    r = c.sync_folder(folder_id, window_size=200, body_type="1", body_size="1024")
+    emails = c.parse_emails(r.get("elements", []))
+    ql = q.lower()
+    matches = []
+    for e in emails:
+        text = " ".join([e.get("subject",""), e.get("from",""), e.get("to",""), e.get("preview",""), e.get("body","")]).lower()
+        if ql in text:
+            matches.append({
+                "subject": e.get("subject", ""), "from": e.get("from", ""),
+                "date": e.get("date", ""), "read": e.get("read", "0") == "1",
+            })
+            if len(matches) >= max_results:
+                break
+    return JSONResponse({"results": matches, "count": len(matches), "query": q})
+
+
+async def api_calendar(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    c = _rest_client()
+    folder_id = request.query_params.get("folder_id") or c.find_folder(8)
+    max_items = int(request.query_params.get("max", "50"))
+
+    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size="1024")
+    events = c.parse_calendar(r.get("elements", []))[:max_items]
+    return JSONResponse({"events": events, "count": len(events)})
+
+
+async def api_contacts(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    c = _rest_client()
+    folder_id = request.query_params.get("folder_id") or c.find_folder(9)
+    max_items = int(request.query_params.get("max", "100"))
+
+    r = c.sync_folder(folder_id, window_size=max_items, body_type="1", body_size="256")
+    contacts = c.parse_contacts(r.get("elements", []))[:max_items]
+    return JSONResponse({"contacts": contacts, "count": len(contacts)})
+
+
+async def api_send_email(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    to = data.get("to", "")
+    subject = data.get("subject", "")
+    if not to or not subject:
+        return JSONResponse({"error": "to and subject are required"}, status_code=400)
+
+    c = _rest_client()
+    result = c.send_email(
+        to=to, subject=subject,
+        body=data.get("body", ""),
+        cc=data.get("cc", ""),
+        content_type=data.get("content_type", "plain"),
+    )
+    return JSONResponse(result)
+
+
+async def api_create_event(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    subject = data.get("subject", "")
+    start_time = data.get("start_time", "")
+    end_time = data.get("end_time", "")
+    if not subject or not start_time or not end_time:
+        return JSONResponse({"error": "subject, start_time, end_time are required"}, status_code=400)
+
+    attendees = None
+    att_str = data.get("attendees", "")
+    if att_str:
+        if isinstance(att_str, list):
+            attendees = att_str
+        else:
+            attendees = [{"email": e.strip(), "name": e.strip()} for e in att_str.split(",") if e.strip()]
+
+    c = _rest_client()
+    result = c.create_event(
+        subject=subject, start_time=start_time, end_time=end_time,
+        location=data.get("location", ""),
+        body=data.get("body", ""),
+        attendees=attendees,
+        all_day=data.get("all_day", False),
+        reminder=data.get("reminder", 15),
+    )
+    return JSONResponse(result)
+
+
+async def api_get_attachment(request: Request):
+    if not _check_api_key(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ref = request.query_params.get("file_reference", "")
+    if not ref:
+        return JSONResponse({"error": "file_reference parameter is required"}, status_code=400)
+    c = _rest_client()
+    result = c.get_attachment(ref)
+    return JSONResponse(result)
+
+
+# ============================================================
 # Entry point
 # ============================================================
+
+
+@mcp.tool(
+    name="exchange_get_attachment",
+    annotations={
+        "title": "Download Email Attachment",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def exchange_get_attachment(
+    file_reference: str = "",
+    ctx: Context = None,
+) -> str:
+    """Download an email attachment by its FileReference.
+
+    First use exchange_get_emails with include_body=true to get attachment
+    file_references, then use this tool to download.
+
+    Args:
+        file_reference: The FileReference string from email attachment metadata
+
+    Returns:
+        JSON with base64-encoded attachment data and content type
+    """
+    if not file_reference:
+        return json.dumps({"error": "file_reference is required"})
+
+    client = get_client(ctx)
+    result = client.get_attachment(file_reference)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
@@ -590,7 +824,25 @@ if __name__ == "__main__":
             if arg.startswith("--port="):
                 port = int(arg.split("=")[1])
         logger.info("Starting MCP server on HTTP 0.0.0.0:%d", port)
-        app = RewriteHostMiddleware(mcp.streamable_http_app())
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+
+        mcp_app = RewriteHostMiddleware(mcp.streamable_http_app())
+
+        rest_routes = [
+            Route("/api/health", api_health, methods=["GET"]),
+            Route("/api/folders", api_folders, methods=["GET"]),
+            Route("/api/emails", api_emails, methods=["GET"]),
+            Route("/api/search", api_search, methods=["GET"]),
+            Route("/api/calendar", api_calendar, methods=["GET"]),
+            Route("/api/contacts", api_contacts, methods=["GET"]),
+            Route("/api/send", api_send_email, methods=["POST"]),
+            Route("/api/event", api_create_event, methods=["POST"]),
+            Route("/api/attachment", api_get_attachment, methods=["GET"]),
+            Mount("/mcp", app=mcp_app),
+        ]
+
+        app = Starlette(routes=rest_routes)
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")
