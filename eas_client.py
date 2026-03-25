@@ -77,9 +77,14 @@ CP_CALENDAR = {
     0x0D: "BusyStatus", 0x0E: "Categories", 0x0F: "Category",
     0x11: "DtStamp", 0x12: "EndTime",
     0x13: "Exception", 0x14: "Exceptions",
-    0x16: "Exception_StartTime", 0x17: "Location",
-    0x18: "MeetingStatus", 0x19: "Organizer_Email",
-    0x1A: "Organizer_Name", 0x1B: "Recurrence",
+    0x15: "Exception_Deleted", 0x16: "Exception_StartTime",
+    0x17: "Location", 0x18: "MeetingStatus",
+    0x19: "Organizer_Email", 0x1A: "Organizer_Name",
+    0x1B: "Recurrence", 0x1C: "Recurrence_Type",
+    0x1D: "Recurrence_Until", 0x1E: "Recurrence_Occurrences",
+    0x1F: "Recurrence_Interval", 0x20: "Recurrence_DayOfWeek",
+    0x21: "Recurrence_DayOfMonth", 0x22: "Recurrence_WeekOfMonth",
+    0x23: "Recurrence_MonthOfYear",
     0x24: "Reminder", 0x25: "Sensitivity", 0x26: "Subject",
     0x27: "StartTime", 0x28: "UID",
     0x29: "Attendee_Status", 0x2A: "Attendee_Type",
@@ -439,7 +444,7 @@ class EASClient:
     # --- Sync ---
     def sync(self, collection_id: str, sync_key: str = "0",
              window_size: int = 50, body_type: str = "1",
-             body_size: str = "51200") -> dict:
+             body_size: str = "51200", filter_type: str = "") -> dict:
         enc = WBXMLEncoder()
         enc.tag_open(0, 0x05)   # Sync
         enc.tag_open(0, 0x1C)   # Collections
@@ -451,6 +456,8 @@ class EASClient:
             enc.tag_empty(0, 0x13)  # GetChanges
             enc.tag_str(0, 0x15, str(window_size))
             enc.tag_open(0, 0x17)   # Options
+            if filter_type:
+                enc.tag_str(0, 0x18, filter_type)  # FilterType
             enc.tag_open(17, 0x05)  # BodyPreference
             enc.tag_str(17, 0x06, body_type)
             enc.tag_str(17, 0x07, body_size)
@@ -478,11 +485,52 @@ class EASClient:
         return {"status": status, "sync_key": new_key, "elements": elements}
 
     def sync_folder(self, collection_id: str, **kwargs) -> dict:
+        """Full sync: fetches ALL items by looping until Exchange has no more."""
         r1 = self.sync(collection_id, "0")
         key = r1.get("sync_key")
         if not key:
             return r1
-        return self.sync(collection_id, key, **kwargs)
+
+        all_elements = []
+        max_rounds = 50  # safety limit
+        for _ in range(max_rounds):
+            r = self.sync(collection_id, key, **kwargs)
+            new_key = r.get("sync_key")
+            elements = r.get("elements", [])
+            status = r.get("status")
+
+            # Count actual items (ServerId tags = items)
+            item_count = sum(1 for _, tag, val in elements if tag == "ServerId" and val)
+
+            if elements:
+                all_elements.extend(elements)
+
+            if new_key and new_key != key:
+                key = new_key
+            else:
+                break  # key didn't change = nothing more
+
+            if status == "no_changes" or item_count == 0:
+                break
+
+            logger.info("sync_folder loop: got %d items, continuing...", item_count)
+
+        logger.info("sync_folder complete: %d total elements",
+                    sum(1 for _, tag, val in all_elements if tag == "ServerId" and val))
+
+        return {
+            "status": "1",
+            "sync_key": key,
+            "elements": all_elements,
+        }
+
+    def sync_folder_filtered(self, collection_id: str, filter_type: str = "5", **kwargs) -> dict:
+        """Sync with date filter. filter_type: 4=2weeks, 5=1month, 6=3months, 7=6months"""
+        r1 = self.sync(collection_id, "0", filter_type=filter_type)
+        key = r1.get("sync_key")
+        if not key:
+            return r1
+        return self.sync(collection_id, key, filter_type=filter_type, **kwargs)
 
     # --- Parsers ---
     def parse_emails(self, elements: list) -> list:
@@ -531,6 +579,14 @@ class EASClient:
                 "AllDayEvent": "all_day", "BusyStatus": "busy_status",
                 "Reminder": "reminder", "UID": "uid", "DtStamp": "stamp",
                 "MeetingStatus": "meeting_status",
+                "Recurrence_Type": "recurrence_type",
+                "Recurrence_Interval": "recurrence_interval",
+                "Recurrence_DayOfWeek": "recurrence_dayofweek",
+                "Recurrence_DayOfMonth": "recurrence_dayofmonth",
+                "Recurrence_WeekOfMonth": "recurrence_weekofmonth",
+                "Recurrence_MonthOfYear": "recurrence_monthofyear",
+                "Recurrence_Until": "recurrence_until",
+                "Recurrence_Occurrences": "recurrence_occurrences",
             }
             if tag == "Attendee_Name":
                 cur.setdefault("attendees", []).append({"name": value})
@@ -543,6 +599,196 @@ class EASClient:
         if cur.get("subject") or cur.get("start"):
             events.append(cur)
         return events
+
+    def expand_recurring(self, events: list, date_from: str, date_to: str) -> list:
+        """Expand recurring events into individual instances for a date range.
+        
+        Args:
+            events: list from parse_calendar
+            date_from: YYYYMMDD
+            date_to: YYYYMMDD
+            
+        Returns:
+            list of events with recurring ones expanded into instances
+        """
+        from datetime import timedelta
+
+        def parse_dt(s):
+            if not s:
+                return None
+            s = s.replace("-", "").replace(":", "").replace(".000", "")
+            if not s.endswith("Z"):
+                s += "Z"
+            try:
+                return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
+            except:
+                return None
+
+        range_start = datetime.strptime(date_from, "%Y%m%d")
+        range_end = datetime.strptime(date_to, "%Y%m%d") + timedelta(days=1)
+
+        result = []
+
+        for ev in events:
+            start_dt = parse_dt(ev.get("start"))
+            end_dt = parse_dt(ev.get("end"))
+
+            if not start_dt:
+                result.append(ev)
+                continue
+
+            rec_type = ev.get("recurrence_type")
+            if rec_type is None:
+                # Non-recurring: include if in range
+                if start_dt.strftime("%Y%m%d") >= date_from and start_dt.strftime("%Y%m%d") <= date_to:
+                    result.append(ev)
+                continue
+
+            # Recurring event - expand
+            try:
+                rec_type = int(rec_type)
+            except:
+                result.append(ev)
+                continue
+
+            interval = int(ev.get("recurrence_interval", "1") or "1")
+            dow = int(ev.get("recurrence_dayofweek", "0") or "0")
+            dom = int(ev.get("recurrence_dayofmonth", "0") or "0")
+            until_dt = parse_dt(ev.get("recurrence_until"))
+            max_occ = int(ev.get("recurrence_occurrences", "0") or "0")
+            duration = (end_dt - start_dt) if end_dt else timedelta(hours=1)
+
+            # Effective end
+            eff_end = range_end
+            if until_dt and until_dt < eff_end:
+                eff_end = until_dt
+
+            occ_count = 0
+            max_iterations = 1000  # safety
+
+            if rec_type == 0:
+                # Daily
+                cur = start_dt
+                for _ in range(max_iterations):
+                    if cur >= eff_end:
+                        break
+                    if max_occ and occ_count >= max_occ:
+                        break
+                    if cur.strftime("%Y%m%d") >= date_from and cur.strftime("%Y%m%d") <= date_to:
+                        instance = ev.copy()
+                        instance["start"] = cur.strftime("%Y%m%dT%H%M%SZ")
+                        instance["end"] = (cur + duration).strftime("%Y%m%dT%H%M%SZ")
+                        instance["is_recurring_instance"] = True
+                        result.append(instance)
+                    occ_count += 1
+                    cur += timedelta(days=interval)
+
+            elif rec_type == 1:
+                # Weekly (dow is bitmask: 1=Sun,2=Mon,4=Tue,8=Wed,16=Thu,32=Fri,64=Sat)
+                day_map = {0: 2, 1: 4, 2: 8, 3: 16, 4: 32, 5: 64, 6: 1}  # python weekday -> EAS
+                # If dow==0, use the day of the original start
+                if dow == 0:
+                    dow = day_map.get(start_dt.weekday(), 0)
+                
+                cur = start_dt
+                week_count = 0
+                last_week = -1
+                for _ in range(max_iterations):
+                    if cur >= eff_end:
+                        break
+                    if max_occ and occ_count >= max_occ:
+                        break
+                    
+                    # Check week interval
+                    weeks_since = (cur - start_dt).days // 7
+                    if interval > 1 and weeks_since % interval != 0:
+                        cur += timedelta(days=1)
+                        continue
+                    
+                    py_wd = cur.weekday()
+                    eas_wd = day_map.get(py_wd, 0)
+                    
+                    if dow & eas_wd:
+                        if cur.strftime("%Y%m%d") >= date_from and cur.strftime("%Y%m%d") <= date_to:
+                            instance = ev.copy()
+                            t = start_dt.strftime("%H%M%S")
+                            instance["start"] = cur.strftime(f"%Y%m%dT{t}Z")
+                            instance["end"] = (cur + duration).strftime(f"%Y%m%dT") + (start_dt + duration).strftime("%H%M%SZ")
+                            instance["is_recurring_instance"] = True
+                            result.append(instance)
+                        occ_count += 1
+                    
+                    cur += timedelta(days=1)
+
+            elif rec_type == 2:
+                # Monthly (specific day of month)
+                if dom == 0:
+                    dom = start_dt.day
+                cur_year = start_dt.year
+                cur_month = start_dt.month
+                for _ in range(max_iterations):
+                    if max_occ and occ_count >= max_occ:
+                        break
+                    try:
+                        cur = start_dt.replace(year=cur_year, month=cur_month, day=dom)
+                    except ValueError:
+                        # Day doesn't exist in this month (e.g. Feb 30)
+                        cur_month += interval
+                        if cur_month > 12:
+                            cur_year += cur_month // 12
+                            cur_month = cur_month % 12 or 12
+                        continue
+                    
+                    if cur >= eff_end:
+                        break
+                    
+                    if cur.strftime("%Y%m%d") >= date_from and cur.strftime("%Y%m%d") <= date_to:
+                        instance = ev.copy()
+                        t = start_dt.strftime("%H%M%S")
+                        instance["start"] = cur.strftime(f"%Y%m%dT{t}Z")
+                        instance["end"] = (cur + duration).strftime(f"%Y%m%dT") + (start_dt + duration).strftime("%H%M%SZ")
+                        instance["is_recurring_instance"] = True
+                        result.append(instance)
+                    occ_count += 1
+                    
+                    cur_month += interval
+                    if cur_month > 12:
+                        cur_year += (cur_month - 1) // 12
+                        cur_month = (cur_month - 1) % 12 + 1
+
+            elif rec_type == 5:
+                # Yearly (specific month and day)
+                moy = int(ev.get("recurrence_monthofyear", "0") or "0") or start_dt.month
+                if dom == 0:
+                    dom = start_dt.day
+                cur_year = start_dt.year
+                for _ in range(max_iterations):
+                    if max_occ and occ_count >= max_occ:
+                        break
+                    try:
+                        cur = start_dt.replace(year=cur_year, month=moy, day=dom)
+                    except ValueError:
+                        cur_year += interval
+                        continue
+                    if cur >= eff_end:
+                        break
+                    if cur.strftime("%Y%m%d") >= date_from and cur.strftime("%Y%m%d") <= date_to:
+                        instance = ev.copy()
+                        t = start_dt.strftime("%H%M%S")
+                        instance["start"] = cur.strftime(f"%Y%m%dT{t}Z")
+                        instance["end"] = (cur + duration).strftime(f"%Y%m%dT") + (start_dt + duration).strftime("%H%M%SZ")
+                        instance["is_recurring_instance"] = True
+                        result.append(instance)
+                    occ_count += 1
+                    cur_year += interval
+
+            else:
+                # Unknown type - include as-is if in range
+                if start_dt.strftime("%Y%m%d") >= date_from and start_dt.strftime("%Y%m%d") <= date_to:
+                    result.append(ev)
+
+        result.sort(key=lambda e: e.get("start", ""))
+        return result
 
     def parse_contacts(self, elements: list) -> list:
         contacts = []

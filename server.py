@@ -298,49 +298,55 @@ async def exchange_get_emails(folder_id: str = None, max_items: int = 25, includ
         "openWorldHint": False,
     }
 )
-async def exchange_get_calendar(folder_id: str = None, max_items: int = 50, ctx: Context = None) -> str:
-    """Fetch calendar events from Exchange.
-
-    By default reads from the primary Calendar folder.
-    Returns event subject, start/end times, location, organizer, attendees.
+async def exchange_get_calendar(
+    folder_id: str = None,
+    max_items: int = 500,
+    date_from: str = "",
+    date_to: str = "",
+    ctx: Context = None,
+) -> str:
+    """Fetch calendar events from Exchange with optional date filtering.
 
     Args:
-        params: GetCalendarInput with folder_id, max_items
+        folder_id: Calendar folder ServerId (default: primary Calendar)
+        max_items: Maximum events to scan (default 500)
+        date_from: Start date filter YYYY-MM-DD (inclusive). Omit for no lower bound.
+        date_to: End date filter YYYY-MM-DD (inclusive). Omit for no upper bound.
 
     Returns:
-        JSON with list of calendar events
+        JSON with list of calendar events, filtered and sorted by start time.
+
+    Examples:
+        Today's events: date_from="2026-03-25", date_to="2026-03-25"
+        This week: date_from="2026-03-24", date_to="2026-03-30"
+        All events: omit both dates
     """
     client = get_client(ctx)
 
-    folder_id = folder_id
-    if not folder_id:
-        folder_id = client.find_folder(8)  # Calendar
-        if not folder_id:
-            return json.dumps({"error": "Calendar folder not found."})
+    fid = folder_id or client.find_folder(8)
+    if not fid:
+        return json.dumps({"error": "Calendar folder not found."})
 
-    result = client.sync_folder(
-        folder_id,
-        window_size=max_items,
-        body_type="1",
-        body_size="1024",
-    )
+    result = client.sync_folder(fid, window_size=max_items, body_type="1", body_size="4096")
 
     if not result.get("elements"):
-        return json.dumps({
-            "events": [],
-            "count": 0,
-            "folder_id": folder_id,
-            "status": result.get("status", "unknown"),
-        }, ensure_ascii=False)
+        return json.dumps({"events": [], "count": 0, "date_from": date_from, "date_to": date_to}, ensure_ascii=False)
 
     events = client.parse_calendar(result["elements"])
-    events = events[:max_items]
+
+    # Filter by date range, expanding recurring events
+    if date_from or date_to:
+        df = date_from.replace("-", "") if date_from else "00000000"
+        dt = date_to.replace("-", "") if date_to else "99999999"
+        events = client.expand_recurring(events, df, dt)
+    else:
+        events.sort(key=lambda e: e.get("start", ""))
 
     return json.dumps({
         "events": events,
         "count": len(events),
-        "folder_id": folder_id,
-        "sync_key": result.get("sync_key"),
+        "date_from": date_from,
+        "date_to": date_to,
     }, ensure_ascii=False, indent=2)
 
 
@@ -615,17 +621,39 @@ async def api_search(
 @api.get("/api/calendar", tags=["Calendar"], summary="Get calendar events")
 async def api_calendar(
     folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
-    max: int = Query(50, ge=1, le=200, description="Maximum events"),
+    max: int = Query(500, ge=1, le=1000, description="Maximum events to scan"),
+    date_from: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive)"),
+    date_to: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
+    date: Optional[str] = Query(None, description="Shortcut: single day YYYY-MM-DD (sets both from and to)"),
     x_api_key: str = Header(default=None),
     authorization: str = Header(default=None),
 ):
-    """Fetch calendar events. Default is primary Calendar folder."""
+    """Fetch calendar events with date filtering.
+    
+    Use date for a single day, or date_from/date_to for a range.
+    Examples: ?date=2026-03-25 or ?date_from=2026-03-24&date_to=2026-03-30
+    """
     _verify_key(x_api_key, authorization)
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
-    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="1024")
-    events = c.parse_calendar(r.get("elements", []))[:max]
-    return {"events": events, "count": len(events)}
+    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="4096")
+    events = c.parse_calendar(r.get("elements", []))
+
+    # Handle date shortcut
+    df = date_from
+    dt = date_to
+    if date:
+        df = date
+        dt = date
+
+    if df or dt:
+        df_s = (df or "").replace("-", "") or "00000000"
+        dt_s = (dt or "").replace("-", "") or "99999999"
+        events = c.expand_recurring(events, df_s, dt_s)
+
+    events.sort(key=lambda e: e.get("start", ""))
+    return {"events": events, "count": len(events), "date_from": df, "date_to": dt}
+
 
 
 @api.get("/api/contacts", tags=["Contacts"], summary="Get contacts")
