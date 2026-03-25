@@ -260,6 +260,7 @@ class EASClient:
         )
         self.folders: dict = {}
         self.sync_keys: dict = {}
+        self.incr_keys: dict = {}
         self.state_file = state_file or ""
         if self.state_file:
             self._load_state()
@@ -295,6 +296,7 @@ class EASClient:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
                 self.sync_keys = state.get("sync_keys", {})
+                self.incr_keys = state.get("incr_keys", {})
                 logger.info("Loaded state: %d sync keys", len(self.sync_keys))
         except (FileNotFoundError, json.JSONDecodeError):
             logger.info("No existing state file, starting fresh")
@@ -304,7 +306,7 @@ class EASClient:
             return
         try:
             with open(self.state_file, 'w') as f:
-                json.dump({"sync_keys": self.sync_keys}, f)
+                json.dump({"sync_keys": self.sync_keys, "incr_keys": self.incr_keys}, f)
         except Exception as e:
             logger.error("Failed to save state: %s", e)
 
@@ -319,7 +321,7 @@ class EASClient:
 
         Returns dict with status, sync_key, elements, is_initial.
         """
-        stored_key = self.sync_keys.get(str(collection_id))
+        stored_key = self.incr_keys.get(str(collection_id))
 
         if not stored_key:
             # First time: drain all existing items to establish baseline
@@ -351,7 +353,7 @@ class EASClient:
                 if count == 0:
                     break
 
-            self.sync_keys[str(collection_id)] = key
+            self.incr_keys[str(collection_id)] = key
             self._save_state()
             logger.info("Initial sync done for folder %s: drained %d items, key=%s",
                        collection_id, total_drained, key)
@@ -376,13 +378,13 @@ class EASClient:
                     "elements": [], "is_initial": False}
 
         if new_key:
-            self.sync_keys[str(collection_id)] = new_key
+            self.incr_keys[str(collection_id)] = new_key
             self._save_state()
 
         # Handle invalid sync key (server reset)
         if status in ("3", "12"):
             logger.warning("SyncKey invalid, resetting for folder %s", collection_id)
-            del self.sync_keys[str(collection_id)]
+            del self.incr_keys[str(collection_id)]
             self._save_state()
             return self.sync_incremental(collection_id, window_size, body_type, body_size)
 
