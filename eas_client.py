@@ -1056,7 +1056,32 @@ class EASClient:
             calendar_id_str = str(cal_id)
             stored_key = self.incr_keys.get(calendar_id_str) or self.sync_keys.get(calendar_id_str)
             if stored_key:
-                return stored_key
+                preflight_response = self.sync(
+                    calendar_id_str,
+                    stored_key,
+                    window_size=1,
+                    body_type="1",
+                    body_size="0",
+                )
+                preflight_status = preflight_response.get("status")
+                refreshed_key = preflight_response.get("sync_key") or stored_key
+
+                if preflight_status in ("1", "no_changes", None):
+                    return refreshed_key
+
+                if preflight_status in ("3", "6", "12"):
+                    logger.warning(
+                        "create_event: preflight SyncKey rejected for calendar %s (status=%s), reinitializing",
+                        calendar_id_str,
+                        preflight_status,
+                    )
+                else:
+                    logger.warning(
+                        "create_event: preflight returned status=%s for calendar %s, trying refreshed key",
+                        preflight_status,
+                        calendar_id_str,
+                    )
+                    return refreshed_key
 
             logger.info("create_event: no stored SyncKey for calendar %s, initializing", calendar_id_str)
             initial_response = self.sync(calendar_id_str, "0")
