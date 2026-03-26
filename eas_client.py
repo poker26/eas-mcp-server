@@ -130,7 +130,7 @@ CP_ITEMOPS = {
 
 ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
-    4: CP_CALENDAR, 7: CP_FOLDER, 13: CP_SEARCH, 14: CP_ITEMOPS, 17: CP_AIRSYNCBASE,
+    4: CP_CALENDAR, 7: CP_FOLDER, 14: CP_ITEMOPS, 15: CP_SEARCH, 17: CP_AIRSYNCBASE,
 }
 
 FOLDER_TYPES = {
@@ -1105,29 +1105,29 @@ class EASClient:
             return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{time_part}"
 
         enc = WBXMLEncoder()
-        enc.tag_open(13, 0x05)   # Search
-        enc.tag_open(13, 0x06)   # Store
-        enc.tag_str(13, 0x07, "Mailbox")  # Name
+        enc.tag_open(15, 0x05)   # Search
+        enc.tag_open(15, 0x06)   # Store
+        enc.tag_str(15, 0x07, "Mailbox")  # Name
 
-        enc.tag_open(13, 0x08)   # Query
-        enc.tag_open(13, 0x12)   # And
+        enc.tag_open(15, 0x08)   # Query
+        enc.tag_open(15, 0x12)   # And
         enc.tag_str(0, 0x10, "Calendar")       # AirSync:Class
         enc.tag_str(0, 0x12, str(folder_id))   # AirSync:CollectionId
         if date_from:
-            enc.tag_open(13, 0x1A)             # GreaterThan
+            enc.tag_open(15, 0x1A)             # GreaterThan
             enc.tag_empty(4, 0x27)             # Calendar:StartTime (field reference)
-            enc.tag_str(13, 0x11, to_iso(date_from))  # Value
+            enc.tag_str(15, 0x11, to_iso(date_from))  # Value
             enc.end()
         if date_to:
-            enc.tag_open(13, 0x19)             # LessThan
+            enc.tag_open(15, 0x19)             # LessThan
             enc.tag_empty(4, 0x12)             # Calendar:EndTime (field reference)
-            enc.tag_str(13, 0x11, to_iso(date_to, end_of_day=True))  # Value
+            enc.tag_str(15, 0x11, to_iso(date_to, end_of_day=True))  # Value
             enc.end()
         enc.end()  # And
         enc.end()  # Query
 
-        enc.tag_open(13, 0x09)   # Options
-        enc.tag_str(13, 0x0A, f"0-{max_items - 1}")  # Range
+        enc.tag_open(15, 0x09)   # Options
+        enc.tag_str(15, 0x0A, f"0-{max_items - 1}")  # Range
         enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
         enc.tag_str(17, 0x06, "1")         # Type = plain text
         enc.tag_str(17, 0x07, body_size)   # TruncationSize
