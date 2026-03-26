@@ -1145,17 +1145,9 @@ class EASClient:
 
         client_id = str(uuid.uuid4())[:8]
 
-        for attempt_index in range(2):
-            response = self._post("Sync", build_add_request(write_sync_key, client_id))
-            if response.status_code != 200:
-                return {"status": f"HTTP {response.status_code}"}
-            if not response.content:
-                self._store_collection_key(cal_id, write_sync_key)
-                return {"status": "created_empty_response", "client_id": client_id}
-
-            elements = self._decode(response)
+        def parse_add_response(elements: list, default_sync_key: str):
             collection_status = self._find(elements, "Status")
-            collection_sync_key = self._find(elements, "SyncKey") or write_sync_key
+            collection_sync_key = self._find(elements, "SyncKey") or default_sync_key
             response_status = collection_status
             created_server_id = None
             in_responses = False
@@ -1166,7 +1158,20 @@ class EASClient:
                     response_status = value
                 if in_responses and tag == "ServerId" and value:
                     created_server_id = value
+            return response_status, created_server_id, collection_sync_key
 
+        def perform_add(sync_key_value: str):
+            response = self._post("Sync", build_add_request(sync_key_value, client_id))
+            if response.status_code != 200:
+                return {"status": f"HTTP {response.status_code}", "client_id": client_id}
+            if not response.content:
+                self._store_collection_key(cal_id, sync_key_value)
+                return {"status": "created_empty_response", "client_id": client_id}
+
+            elements = self._decode(response)
+            response_status, created_server_id, collection_sync_key = parse_add_response(
+                elements, sync_key_value
+            )
             if response_status == "1":
                 self._store_collection_key(cal_id, collection_sync_key)
                 return {
@@ -1174,6 +1179,17 @@ class EASClient:
                     "server_id": created_server_id,
                     "client_id": client_id,
                 }
+            return {
+                "status": f"error_{response_status}",
+                "client_id": client_id,
+                "response_status": response_status,
+            }
+
+        for attempt_index in range(2):
+            add_result = perform_add(write_sync_key)
+            response_status = add_result.get("response_status")
+            if add_result.get("status") in ("created", "created_empty_response"):
+                return add_result
 
             if response_status in ("3", "6", "12") and attempt_index == 0:
                 logger.warning(
@@ -1188,7 +1204,28 @@ class EASClient:
                 write_sync_key = refreshed_key
                 continue
 
-            return {"status": f"error_{response_status}", "client_id": client_id}
+            if response_status == "6" and attempt_index == 1:
+                logger.warning(
+                    "create_event: status=6 persists for calendar %s, falling back to legacy init flow",
+                    cal_id,
+                )
+                legacy_init = self.sync(str(cal_id), "0")
+                legacy_key = legacy_init.get("sync_key")
+                if not legacy_key:
+                    return {"status": "error_6", "client_id": client_id}
+                legacy_advance = self.sync(str(cal_id), legacy_key, window_size=1)
+                legacy_final_key = legacy_advance.get("sync_key") or legacy_key
+                legacy_result = perform_add(legacy_final_key)
+                if legacy_result.get("status") in ("created", "created_empty_response"):
+                    return legacy_result
+                logger.error(
+                    "create_event: legacy fallback failed for calendar %s, result=%s",
+                    cal_id,
+                    legacy_result,
+                )
+                return {"status": "error_6", "client_id": client_id}
+
+            return {"status": f"error_{response_status or 'unknown'}", "client_id": client_id}
 
         return {"status": "error_retry_exhausted", "client_id": client_id}
 
