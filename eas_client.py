@@ -518,6 +518,13 @@ class EASClient:
         logger.info("sync_folder complete: %d total elements",
                     sum(1 for _, tag, val in all_elements if tag == "ServerId" and val))
 
+        # Keep incr_keys in sync so that sync_incremental (get_new_events) can
+        # continue from the current position instead of hitting an invalid key.
+        # sync(fid, "0") resets the server-side sync state, which invalidates
+        # any previously stored incr_keys entry for this folder.
+        self.incr_keys[str(collection_id)] = key
+        self._save_state()
+
         return {
             "status": "1",
             "sync_key": key,
