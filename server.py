@@ -333,11 +333,16 @@ async def exchange_get_calendar(
         date_to=date_to,
         max_items=max_items,
     )
+    events = client.parse_search_calendar(result.get("elements", []))
+    search_total = result.get("total", 0)
 
-    if not result.get("elements"):
-        return json.dumps({"events": [], "count": 0, "date_from": date_from, "date_to": date_to}, ensure_ascii=False)
-
-    events = client.parse_search_calendar(result["elements"])
+    if (date_from or date_to) and search_total == 0:
+        logger.warning(
+            "exchange_get_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
+            fid, date_from, date_to,
+        )
+        fallback = client.sync_folder(fid, window_size=max_items, body_type="1", body_size="4096")
+        events = client.parse_calendar(fallback.get("elements", []))
 
     # Expand recurring events if a date range is specified
     if date_from or date_to:
@@ -651,6 +656,15 @@ async def api_calendar(
 
     r = c.search_calendar(fid, date_from=df or "", date_to=dt or "", max_items=max)
     events = c.parse_search_calendar(r.get("elements", []))
+    search_total = r.get("total", 0)
+
+    if (df or dt) and search_total == 0:
+        logger.warning(
+            "api_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
+            fid, df, dt,
+        )
+        fallback = c.sync_folder(fid, window_size=max, body_type="1", body_size="4096")
+        events = c.parse_calendar(fallback.get("elements", []))
 
     if df or dt:
         df_s = (df or "").replace("-", "") or "00000000"
