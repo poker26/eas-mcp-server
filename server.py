@@ -641,8 +641,6 @@ async def api_calendar(
     _verify_key(x_api_key, authorization)
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
-    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="4096")
-    events = c.parse_calendar(r.get("elements", []))
 
     # Handle date shortcut
     df = date_from
@@ -650,6 +648,9 @@ async def api_calendar(
     if date:
         df = date
         dt = date
+
+    r = c.search_calendar(fid, date_from=df or "", date_to=dt or "", max_items=max)
+    events = c.parse_search_calendar(r.get("elements", []))
 
     if df or dt:
         df_s = (df or "").replace("-", "") or "00000000"
