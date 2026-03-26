@@ -1150,9 +1150,9 @@ class EASClient:
                     "client_id": client_id,
                 }
 
-            if response_status in ("3", "12") and attempt_index == 0:
+            if response_status in ("3", "6", "12") and attempt_index == 0:
                 logger.warning(
-                    "create_event: SyncKey invalid for calendar %s (status=%s), reinitializing once",
+                    "create_event: Sync Add rejected for calendar %s (status=%s), reinitializing once",
                     cal_id,
                     response_status,
                 )
