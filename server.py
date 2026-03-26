@@ -327,14 +327,19 @@ async def exchange_get_calendar(
     if not fid:
         return json.dumps({"error": "Calendar folder not found."})
 
-    result = client.sync_folder(fid, window_size=max_items, body_type="1", body_size="4096")
+    result = client.search_calendar(
+        fid,
+        date_from=date_from,
+        date_to=date_to,
+        max_items=max_items,
+    )
 
     if not result.get("elements"):
         return json.dumps({"events": [], "count": 0, "date_from": date_from, "date_to": date_to}, ensure_ascii=False)
 
-    events = client.parse_calendar(result["elements"])
+    events = client.parse_search_calendar(result["elements"])
 
-    # Filter by date range, expanding recurring events
+    # Expand recurring events if a date range is specified
     if date_from or date_to:
         df = date_from.replace("-", "") if date_from else "00000000"
         dt = date_to.replace("-", "") if date_to else "99999999"

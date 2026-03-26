@@ -107,6 +107,17 @@ CP_AIRSYNCBASE = {
     0x19: "Preview",
 }
 
+# Page 13: Search
+CP_SEARCH = {
+    0x05: "Search", 0x06: "Store", 0x07: "Name",
+    0x08: "Query", 0x09: "Options", 0x0A: "Range",
+    0x0B: "Status", 0x0C: "Response", 0x0D: "Result",
+    0x0E: "Properties", 0x0F: "Total",
+    0x10: "EqualTo", 0x11: "Value", 0x12: "And", 0x13: "Or",
+    0x14: "FreeText", 0x16: "DeepTraversal", 0x17: "LongId",
+    0x18: "RebuildResults", 0x19: "LessThan", 0x1A: "GreaterThan",
+}
+
 # Page 14: ItemOperations
 CP_ITEMOPS = {
     0x05: "ItemOperations", 0x06: "Fetch", 0x07: "Store",
@@ -119,7 +130,7 @@ CP_ITEMOPS = {
 
 ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
-    4: CP_CALENDAR, 7: CP_FOLDER, 14: CP_ITEMOPS, 17: CP_AIRSYNCBASE,
+    4: CP_CALENDAR, 7: CP_FOLDER, 13: CP_SEARCH, 14: CP_ITEMOPS, 17: CP_AIRSYNCBASE,
 }
 
 FOLDER_TYPES = {
@@ -1070,3 +1081,122 @@ class EASClient:
             return {"status": "created_empty_response", "client_id": client_id}
         else:
             return {"status": f"HTTP {resp.status_code}"}
+
+    # --- Search Calendar ---
+    def search_calendar(self, folder_id: str, date_from: str = "", date_to: str = "",
+                        max_items: int = 500, body_size: str = "4096") -> dict:
+        """Query calendar items by date range using the EAS Search command.
+
+        Unlike sync_folder, this command does NOT use or modify any SyncKey.
+        It is safe to call concurrently with sync_incremental (get_new_events).
+
+        Args:
+            folder_id: Calendar folder ServerId
+            date_from: YYYY-MM-DD lower bound for StartTime (inclusive), or ""
+            date_to:   YYYY-MM-DD upper bound for EndTime (inclusive), or ""
+            max_items: Maximum number of results (Range header)
+            body_size: Body truncation size in bytes
+        Returns:
+            dict with status, elements (raw decoded WBXML), total
+        """
+        def to_iso(date_str: str, end_of_day: bool = False) -> str:
+            d = date_str.replace("-", "")
+            time_part = "23:59:59.999Z" if end_of_day else "00:00:00.000Z"
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{time_part}"
+
+        enc = WBXMLEncoder()
+        enc.tag_open(13, 0x05)   # Search
+        enc.tag_open(13, 0x06)   # Store
+        enc.tag_str(13, 0x07, "Mailbox")  # Name
+
+        enc.tag_open(13, 0x08)   # Query
+        enc.tag_open(13, 0x12)   # And
+        enc.tag_str(0, 0x10, "Calendar")       # AirSync:Class
+        enc.tag_str(0, 0x12, str(folder_id))   # AirSync:CollectionId
+        if date_from:
+            enc.tag_open(13, 0x1A)             # GreaterThan
+            enc.tag_empty(4, 0x27)             # Calendar:StartTime (field reference)
+            enc.tag_str(13, 0x11, to_iso(date_from))  # Value
+            enc.end()
+        if date_to:
+            enc.tag_open(13, 0x19)             # LessThan
+            enc.tag_empty(4, 0x12)             # Calendar:EndTime (field reference)
+            enc.tag_str(13, 0x11, to_iso(date_to, end_of_day=True))  # Value
+            enc.end()
+        enc.end()  # And
+        enc.end()  # Query
+
+        enc.tag_open(13, 0x09)   # Options
+        enc.tag_str(13, 0x0A, f"0-{max_items - 1}")  # Range
+        enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
+        enc.tag_str(17, 0x06, "1")         # Type = plain text
+        enc.tag_str(17, 0x07, body_size)   # TruncationSize
+        enc.end()  # BodyPreference
+        enc.end()  # Options
+
+        enc.end()  # Store
+        enc.end()  # Search
+
+        resp = self._post("Search", enc.get())
+
+        if resp.status_code != 200:
+            return {"status": f"HTTP {resp.status_code}", "elements": []}
+        if not resp.content:
+            return {"status": "empty", "elements": []}
+
+        elements = self._decode(resp)
+        status = self._find(elements, "Status")
+        total_str = self._find(elements, "Total")
+        total = int(total_str) if total_str and total_str.isdigit() else 0
+        logger.info("search_calendar: status=%s total=%s", status, total)
+        return {"status": status, "elements": elements, "total": total}
+
+    def parse_search_calendar(self, elements: list) -> list:
+        """Parse calendar events from an EAS Search response.
+
+        Search results are grouped under Result tags (not ServerId like Sync).
+        LongId is used as the item identifier.
+        """
+        events = []
+        cur = None
+        for _, tag, value in elements:
+            if tag == "Result" and value is None:
+                if cur is not None and (cur.get("subject") or cur.get("start")):
+                    events.append(cur)
+                cur = {}
+                continue
+            if cur is None:
+                continue
+            if tag == "LongId" and value:
+                cur["server_id"] = value
+                continue
+            if value is None:
+                continue
+            mapping = {
+                "Subject": "subject", "StartTime": "start",
+                "EndTime": "end", "Location": "location",
+                "Organizer_Name": "organizer_name",
+                "Organizer_Email": "organizer_email",
+                "AllDayEvent": "all_day", "BusyStatus": "busy_status",
+                "Reminder": "reminder", "UID": "uid", "DtStamp": "stamp",
+                "MeetingStatus": "meeting_status",
+                "Recurrence_Type": "recurrence_type",
+                "Recurrence_Interval": "recurrence_interval",
+                "Recurrence_DayOfWeek": "recurrence_dayofweek",
+                "Recurrence_DayOfMonth": "recurrence_dayofmonth",
+                "Recurrence_WeekOfMonth": "recurrence_weekofmonth",
+                "Recurrence_MonthOfYear": "recurrence_monthofyear",
+                "Recurrence_Until": "recurrence_until",
+                "Recurrence_Occurrences": "recurrence_occurrences",
+            }
+            if tag == "Attendee_Name":
+                cur.setdefault("attendees", []).append({"name": value})
+            elif tag == "Attendee_Email":
+                att = cur.get("attendees", [])
+                if att:
+                    att[-1]["email"] = value
+            elif tag in mapping:
+                cur[mapping[tag]] = value
+        if cur is not None and (cur.get("subject") or cur.get("start")):
+            events.append(cur)
+        return events
