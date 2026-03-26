@@ -1093,23 +1093,23 @@ class EASClient:
             encoder.tag_open(0, 0x1C)   # Collections
             encoder.tag_open(0, 0x0F)   # Collection
             encoder.tag_str(0, 0x0B, sync_key_value)
+            encoder.tag_str(0, 0x10, "Calendar")  # Class
             encoder.tag_str(0, 0x12, str(cal_id))
             encoder.tag_open(0, 0x16)   # Commands
             encoder.tag_open(0, 0x07)   # Add
             encoder.tag_str(0, 0x0C, client_id_value)
             encoder.tag_open(0, 0x1D)   # ApplicationData
 
+            # Keep payload minimal for maximum Exchange compatibility.
             encoder.tag_str(4, 0x05, utc_tz)
             encoder.tag_str(4, 0x06, "1" if all_day else "0")
-            encoder.tag_str(4, 0x0D, "2")
             encoder.tag_str(4, 0x11, eas_stamp)
             encoder.tag_str(4, 0x12, eas_end)
-            encoder.tag_str(4, 0x25, "0")
             encoder.tag_str(4, 0x26, subject)
             encoder.tag_str(4, 0x27, eas_start)
             encoder.tag_str(4, 0x28, str(uuid.uuid4()))
-            encoder.tag_str(4, 0x18, "1" if attendees else "0")
-            encoder.tag_str(4, 0x24, str(reminder))
+            encoder.tag_str(4, 0x0D, "2")
+            encoder.tag_str(4, 0x25, "0")
 
             if location:
                 encoder.tag_str(4, 0x17, location)
@@ -1121,6 +1121,7 @@ class EASClient:
                 encoder.end()
 
             if attendees:
+                encoder.tag_str(4, 0x18, "1")
                 encoder.tag_open(4, 0x07)  # Attendees
                 for attendee in attendees:
                     encoder.tag_open(4, 0x08)  # Attendee
@@ -1130,6 +1131,11 @@ class EASClient:
                     encoder.tag_str(4, 0x29, "0")
                     encoder.end()
                 encoder.end()
+            else:
+                encoder.tag_str(4, 0x18, "0")
+
+            if reminder and reminder > 0:
+                encoder.tag_str(4, 0x24, str(reminder))
 
             encoder.end()  # ApplicationData
             encoder.end()  # Add
