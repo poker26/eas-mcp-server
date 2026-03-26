@@ -21,6 +21,19 @@ Claude / n8n  -->  MCP Server (HTTP)  -->  Exchange Server (EAS)
 | `exchange_get_contacts` | Fetch contacts from address book |
 | `exchange_search_emails` | Search emails by subject, sender, content |
 
+## Calendar Sync Contract
+
+- `exchange_get_calendar` provides a date-range snapshot for calendar UI/read flows.
+- `exchange_get_new_events` is incremental and should be used for polling/event-driven updates.
+- Warm-up requirement: call `exchange_get_new_events` until `is_initial=false` before relying on incremental results.
+- Write operations (`exchange_create_event` / REST `POST /api/event`) preserve incremental SyncKey state and must not reset the baseline.
+
+Recommended app flow:
+
+1. Fetch snapshot: `exchange_get_calendar` (or REST `/api/calendar`) for the visible range.
+2. Warm-up incremental stream: `exchange_get_new_events` until `is_initial=false`.
+3. Poll `exchange_get_new_events` periodically and merge deltas into local state.
+
 ## Quick Start
 
 ### Local (without Docker)
