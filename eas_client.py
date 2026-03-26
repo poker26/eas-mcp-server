@@ -1096,10 +1096,20 @@ class EASClient:
                     server_id = val
 
             if status == "1":
+                final_sync_key = self._find(elements, "SyncKey") or sync_key2
+                if final_sync_key:
+                    calendar_id = str(cal_id)
+                    self.sync_keys[calendar_id] = final_sync_key
+                    self.incr_keys[calendar_id] = final_sync_key
+                    self._save_state()
                 return {"status": "created", "server_id": server_id, "client_id": client_id}
             else:
                 return {"status": f"error_{status}", "client_id": client_id}
         elif resp.status_code == 200:
+            calendar_id = str(cal_id)
+            self.sync_keys[calendar_id] = sync_key2
+            self.incr_keys[calendar_id] = sync_key2
+            self._save_state()
             return {"status": "created_empty_response", "client_id": client_id}
         else:
             return {"status": f"HTTP {resp.status_code}"}
