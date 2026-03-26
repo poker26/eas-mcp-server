@@ -107,7 +107,9 @@ CP_AIRSYNCBASE = {
     0x19: "Preview",
 }
 
-# Page 13: Search
+# Page 15: Search (MS-ASWBXML). Some Exchange deployments appear to return
+# Search responses using an unexpected code page; we keep a defensive alias
+# in ALL_PAGES for robustness.
 CP_SEARCH = {
     0x05: "Search", 0x06: "Store", 0x07: "Name",
     0x08: "Query", 0x09: "Options", 0x0A: "Range",
@@ -130,7 +132,9 @@ CP_ITEMOPS = {
 
 ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
-    4: CP_CALENDAR, 7: CP_FOLDER, 14: CP_ITEMOPS, 15: CP_SEARCH, 17: CP_AIRSYNCBASE,
+    4: CP_CALENDAR, 7: CP_FOLDER,
+    13: CP_SEARCH,  # defensive alias (expected: Ping)
+    14: CP_ITEMOPS, 15: CP_SEARCH, 17: CP_AIRSYNCBASE,
 }
 
 FOLDER_TYPES = {
@@ -1148,6 +1152,17 @@ class EASClient:
         status = self._find(elements, "Status")
         total_str = self._find(elements, "Total")
         total = int(total_str) if total_str and total_str.isdigit() else 0
+        if status is None:
+            sample_tags = []
+            for _, tag, val in elements[:60]:
+                if val is None:
+                    sample_tags.append(tag)
+                else:
+                    sample_tags.append(f"{tag}={val}")
+            logger.warning(
+                "search_calendar: unable to decode Search response (status=None). sample=%s",
+                sample_tags,
+            )
         logger.info("search_calendar: status=%s total=%s", status, total)
         return {"status": status, "elements": elements, "total": total}
 
