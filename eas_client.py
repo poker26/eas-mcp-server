@@ -348,15 +348,6 @@ class EASClient:
         except Exception as e:
             logger.error("Failed to save state: %s", e)
 
-    def _store_collection_key(self, collection_id: str, sync_key: Optional[str]):
-        """Persist one SyncKey in both full-sync and incremental stores."""
-        if not sync_key:
-            return
-        collection_id_str = str(collection_id)
-        self.sync_keys[collection_id_str] = sync_key
-        self.incr_keys[collection_id_str] = sync_key
-        self._save_state()
-
     # --- Incremental sync ---
     def sync_incremental(self, collection_id: str, window_size: int = 50,
                          body_type: str = "1", body_size: str = "51200") -> dict:
@@ -368,77 +359,53 @@ class EASClient:
 
         Returns dict with status, sync_key, elements, is_initial.
         """
-        collection_id_str = str(collection_id)
+        stored_key = self.incr_keys.get(str(collection_id))
 
-        def initialize_incremental_baseline(reset_reason: str = "") -> dict:
-            reason_suffix = f" ({reset_reason})" if reset_reason else ""
-            logger.info(
-                "Initial sync for folder %s — draining existing items%s",
-                collection_id_str,
-                reason_suffix,
-            )
-            first_sync_response = self.sync(collection_id_str, "0")
-            key = first_sync_response.get("sync_key")
+        if not stored_key:
+            # First time: drain all existing items to establish baseline
+            logger.info("Initial sync for folder %s — draining existing items", collection_id)
+            r1 = self.sync(collection_id, "0")
+            key = r1.get("sync_key")
             if not key:
-                logger.error(
-                    "Failed to initialize baseline for folder %s%s: no SyncKey",
-                    collection_id_str,
-                    reason_suffix,
-                )
                 return {"status": "error", "elements": [], "is_initial": True}
 
+            # Drain loop: keep syncing until no more items
             total_drained = 0
-            max_rounds = 100
-            for _ in range(max_rounds):
-                sync_response = self.sync(
-                    collection_id_str,
-                    key,
-                    window_size=500,
-                    body_type="1",
-                    body_size="0",
-                )
-                new_key = sync_response.get("sync_key")
-                status = sync_response.get("status")
-                elements = sync_response.get("elements", [])
+            while True:
+                r = self.sync(collection_id, key, window_size=500,
+                             body_type="1", body_size="0")
+                new_key = r.get("sync_key")
+                status = r.get("status")
 
+                if status == "no_changes" or not r.get("elements"):
+                    # Fully drained
+                    if new_key:
+                        key = new_key
+                    break
+
+                count = len([e for e in r.get("elements", []) if e[1] == "ServerId" and e[2]])
+                total_drained += count
                 if new_key:
                     key = new_key
 
-                if status == "no_changes" or not elements:
+                if count == 0:
                     break
 
-                item_count = sum(
-                    1 for _, tag, val in elements
-                    if tag == "ServerId" and val
-                )
-                total_drained += item_count
+            self.incr_keys[str(collection_id)] = key
+            self._save_state()
+            logger.info("Initial sync done for folder %s: drained %d items, key=%s",
+                       collection_id, total_drained, key)
 
-                if item_count == 0:
-                    break
-
-            self._store_collection_key(collection_id_str, key)
-            logger.info(
-                "Initial sync done for folder %s: drained %d items, key=%s%s",
-                collection_id_str,
-                total_drained,
-                key,
-                reason_suffix,
-            )
             return {
                 "status": "initial_sync_done",
                 "sync_key": key,
                 "elements": [],
                 "is_initial": True,
                 "drained": total_drained,
-                "reset_reason": reset_reason or None,
             }
 
-        stored_key = self.incr_keys.get(collection_id_str)
-        if not stored_key:
-            return initialize_incremental_baseline()
-
         # Incremental: use stored key — only new items
-        r = self.sync(collection_id_str, stored_key, window_size=window_size,
+        r = self.sync(collection_id, stored_key, window_size=window_size,
                      body_type=body_type, body_size=body_size)
 
         new_key = r.get("sync_key")
@@ -448,21 +415,16 @@ class EASClient:
             return {"status": "no_changes", "sync_key": stored_key,
                     "elements": [], "is_initial": False}
 
+        if new_key:
+            self.incr_keys[str(collection_id)] = new_key
+            self._save_state()
+
         # Handle invalid sync key (server reset)
         if status in ("3", "12"):
-            logger.warning(
-                "SyncKey invalid for folder %s: status=%s, stored_key=%s. Reinitializing baseline.",
-                collection_id_str,
-                status,
-                stored_key,
-            )
-            self.incr_keys.pop(collection_id_str, None)
-            self.sync_keys.pop(collection_id_str, None)
+            logger.warning("SyncKey invalid, resetting for folder %s", collection_id)
+            del self.incr_keys[str(collection_id)]
             self._save_state()
-            return initialize_incremental_baseline(reset_reason=f"invalid_sync_key_{status}")
-
-        if new_key:
-            self._store_collection_key(collection_id_str, new_key)
+            return self.sync_incremental(collection_id, window_size, body_type, body_size)
 
         return {
             "status": status,
@@ -1052,120 +1014,95 @@ class EASClient:
         import base64
         utc_tz = base64.b64encode(b"\x00" * 172).decode()
 
-        def resolve_write_sync_key() -> Optional[str]:
-            calendar_id_str = str(cal_id)
-            stored_key = self.incr_keys.get(calendar_id_str) or self.sync_keys.get(calendar_id_str)
-            if stored_key:
-                return stored_key
-
-            logger.info("create_event: no stored SyncKey for calendar %s, initializing", calendar_id_str)
-            initial_response = self.sync(calendar_id_str, "0")
-            return initial_response.get("sync_key")
-
-        def build_add_request(sync_key_value: str, client_id_value: str) -> bytes:
-            encoder = WBXMLEncoder()
-            encoder.tag_open(0, 0x05)   # Sync
-            encoder.tag_open(0, 0x1C)   # Collections
-            encoder.tag_open(0, 0x0F)   # Collection
-            encoder.tag_str(0, 0x0B, sync_key_value)
-            encoder.tag_str(0, 0x12, str(cal_id))
-            encoder.tag_open(0, 0x16)   # Commands
-            encoder.tag_open(0, 0x07)   # Add
-            encoder.tag_str(0, 0x0C, client_id_value)
-            encoder.tag_open(0, 0x1D)   # ApplicationData
-
-            encoder.tag_str(4, 0x05, utc_tz)
-            encoder.tag_str(4, 0x06, "1" if all_day else "0")
-            encoder.tag_str(4, 0x0D, "2")
-            encoder.tag_str(4, 0x11, eas_stamp)
-            encoder.tag_str(4, 0x12, eas_end)
-            encoder.tag_str(4, 0x25, "0")
-            encoder.tag_str(4, 0x26, subject)
-            encoder.tag_str(4, 0x27, eas_start)
-            encoder.tag_str(4, 0x28, str(uuid.uuid4()))
-            encoder.tag_str(4, 0x18, "1" if attendees else "0")
-            encoder.tag_str(4, 0x24, str(reminder))
-
-            if location:
-                encoder.tag_str(4, 0x17, location)
-
-            if body:
-                encoder.tag_open(17, 0x0A)  # Body
-                encoder.tag_str(17, 0x06, "1")
-                encoder.tag_str(17, 0x0B, body)
-                encoder.end()
-
-            if attendees:
-                encoder.tag_open(4, 0x07)  # Attendees
-                for attendee in attendees:
-                    encoder.tag_open(4, 0x08)  # Attendee
-                    encoder.tag_str(4, 0x09, attendee.get("email", ""))
-                    encoder.tag_str(4, 0x0A, attendee.get("name", attendee.get("email", "")))
-                    encoder.tag_str(4, 0x2A, "1")
-                    encoder.tag_str(4, 0x29, "0")
-                    encoder.end()
-                encoder.end()
-
-            encoder.end()  # ApplicationData
-            encoder.end()  # Add
-            encoder.end()  # Commands
-            encoder.end()  # Collection
-            encoder.end()  # Collections
-            encoder.end()  # Sync
-            return encoder.get()
-
-        write_sync_key = resolve_write_sync_key()
-        if not write_sync_key:
+        # Step 1: get sync key
+        r1 = self.sync(cal_id, "0")
+        sync_key = r1.get("sync_key")
+        if not sync_key:
             return {"status": "error", "message": "Failed to get SyncKey"}
+
+        # Step 2: full sync to advance key
+        r2 = self.sync(cal_id, sync_key, window_size=1)
+        sync_key2 = r2.get("sync_key") or sync_key
 
         client_id = str(uuid.uuid4())[:8]
 
-        for attempt_index in range(2):
-            response = self._post("Sync", build_add_request(write_sync_key, client_id))
-            if response.status_code != 200:
-                return {"status": f"HTTP {response.status_code}"}
-            if not response.content:
-                self._store_collection_key(cal_id, write_sync_key)
-                return {"status": "created_empty_response", "client_id": client_id}
+        enc = WBXMLEncoder()
+        enc.tag_open(0, 0x05)   # Sync
+        enc.tag_open(0, 0x1C)   # Collections
+        enc.tag_open(0, 0x0F)   # Collection
+        enc.tag_str(0, 0x0B, sync_key2)
+        enc.tag_str(0, 0x12, str(cal_id))
+        enc.tag_open(0, 0x16)   # Commands
+        enc.tag_open(0, 0x07)   # Add
+        enc.tag_str(0, 0x0C, client_id)
+        enc.tag_open(0, 0x1D)   # ApplicationData
 
-            elements = self._decode(response)
-            collection_status = self._find(elements, "Status")
-            collection_sync_key = self._find(elements, "SyncKey") or write_sync_key
-            response_status = collection_status
-            created_server_id = None
+        # Calendar fields - page 4
+        enc.tag_str(4, 0x05, utc_tz)        # TimeZone (required!)
+        enc.tag_str(4, 0x06, "1" if all_day else "0")  # AllDayEvent
+        enc.tag_str(4, 0x0D, "2")           # BusyStatus = Busy
+        enc.tag_str(4, 0x11, eas_stamp)     # DtStamp
+        enc.tag_str(4, 0x12, eas_end)       # EndTime
+        enc.tag_str(4, 0x25, "0")           # Sensitivity = Normal
+        enc.tag_str(4, 0x26, subject)       # Subject
+        enc.tag_str(4, 0x27, eas_start)     # StartTime
+        enc.tag_str(4, 0x28, str(uuid.uuid4()))  # UID
+        enc.tag_str(4, 0x18, "1" if attendees else "0")  # MeetingStatus
+        enc.tag_str(4, 0x24, str(reminder)) # Reminder
+
+        if location:
+            enc.tag_str(4, 0x17, location)
+
+        # Body - AirSyncBase page 17
+        if body:
+            enc.tag_open(17, 0x0A)  # Body
+            enc.tag_str(17, 0x06, "1")  # Type = plain text
+            enc.tag_str(17, 0x0B, body)  # Data
+            enc.end()
+
+        # Attendees
+        if attendees:
+            enc.tag_open(4, 0x07)  # Attendees
+            for att in attendees:
+                enc.tag_open(4, 0x08)  # Attendee
+                enc.tag_str(4, 0x09, att.get("email", ""))
+                enc.tag_str(4, 0x0A, att.get("name", att.get("email", "")))
+                enc.tag_str(4, 0x2A, "1")  # Type = Required
+                enc.tag_str(4, 0x29, "0")  # Status = None
+                enc.end()
+            enc.end()
+
+        enc.end()  # ApplicationData
+        enc.end()  # Add
+        enc.end()  # Commands
+        enc.end()  # Collection
+        enc.end()  # Collections
+        enc.end()  # Sync
+
+        resp = self._post("Sync", enc.get())
+
+        if resp.status_code == 200 and resp.content:
+            elements = self._decode(resp)
+            status = self._find(elements, "Status")
+            server_id = None
+            # Find ServerId in Responses section
             in_responses = False
-            for _, tag, value in elements:
+            for _, tag, val in elements:
                 if tag == "Responses":
                     in_responses = True
-                if in_responses and tag == "Status" and value:
-                    response_status = value
-                if in_responses and tag == "ServerId" and value:
-                    created_server_id = value
+                if in_responses and tag == "Status" and val:
+                    status = val
+                if in_responses and tag == "ServerId" and val:
+                    server_id = val
 
-            if response_status == "1":
-                self._store_collection_key(cal_id, collection_sync_key)
-                return {
-                    "status": "created",
-                    "server_id": created_server_id,
-                    "client_id": client_id,
-                }
-
-            if response_status in ("3", "12") and attempt_index == 0:
-                logger.warning(
-                    "create_event: SyncKey invalid for calendar %s (status=%s), reinitializing once",
-                    cal_id,
-                    response_status,
-                )
-                refreshed = self.sync(str(cal_id), "0")
-                refreshed_key = refreshed.get("sync_key")
-                if not refreshed_key:
-                    return {"status": f"error_{response_status}", "client_id": client_id}
-                write_sync_key = refreshed_key
-                continue
-
-            return {"status": f"error_{response_status}", "client_id": client_id}
-
-        return {"status": "error_retry_exhausted", "client_id": client_id}
+            if status == "1":
+                return {"status": "created", "server_id": server_id, "client_id": client_id}
+            else:
+                return {"status": f"error_{status}", "client_id": client_id}
+        elif resp.status_code == 200:
+            return {"status": "created_empty_response", "client_id": client_id}
+        else:
+            return {"status": f"HTTP {resp.status_code}"}
 
     # --- Search Calendar ---
     def search_calendar(self, folder_id: str, date_from: str = "", date_to: str = "",
