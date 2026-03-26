@@ -107,17 +107,35 @@ CP_AIRSYNCBASE = {
     0x19: "Preview",
 }
 
-# Page 15: Search (MS-ASWBXML). Some Exchange deployments appear to return
-# Search responses using an unexpected code page; we keep a defensive alias
-# in ALL_PAGES for robustness.
+# Page 15: Search ([MS-ASWBXML] section 2.1.2.1.16)
 CP_SEARCH = {
-    0x05: "Search", 0x06: "Store", 0x07: "Name",
-    0x08: "Query", 0x09: "Options", 0x0A: "Range",
-    0x0B: "Status", 0x0C: "Response", 0x0D: "Result",
-    0x0E: "Properties", 0x0F: "Total",
-    0x10: "EqualTo", 0x11: "Value", 0x12: "And", 0x13: "Or",
-    0x14: "FreeText", 0x16: "DeepTraversal", 0x17: "LongId",
-    0x18: "RebuildResults", 0x19: "LessThan", 0x1A: "GreaterThan",
+    0x05: "Search",
+    0x07: "Store",
+    0x08: "Name",
+    0x09: "Query",
+    0x0A: "Options",
+    0x0B: "Range",
+    0x0C: "Status",
+    0x0D: "Response",
+    0x0E: "Result",
+    0x0F: "Properties",
+    0x10: "Total",
+    0x11: "EqualTo",
+    0x12: "Value",
+    0x13: "And",
+    0x14: "Or",
+    0x15: "FreeText",
+    0x17: "DeepTraversal",
+    0x18: "LongId",
+    0x19: "RebuildResults",
+    0x1A: "LessThan",
+    0x1B: "GreaterThan",
+    0x1E: "UserName",
+    0x1F: "Password",
+    0x20: "ConversationId",
+    0x21: "Picture",
+    0x22: "MaxSize",
+    0x23: "MaxPictures",
 }
 
 # Page 14: ItemOperations
@@ -1110,28 +1128,28 @@ class EASClient:
 
         enc = WBXMLEncoder()
         enc.tag_open(15, 0x05)   # Search
-        enc.tag_open(15, 0x06)   # Store
-        enc.tag_str(15, 0x07, "Mailbox")  # Name
+        enc.tag_open(15, 0x07)   # Store
+        enc.tag_str(15, 0x08, "Mailbox")  # Name
 
-        enc.tag_open(15, 0x08)   # Query
-        enc.tag_open(15, 0x12)   # And
+        enc.tag_open(15, 0x09)   # Query
+        enc.tag_open(15, 0x13)   # And
         enc.tag_str(0, 0x10, "Calendar")       # AirSync:Class
         enc.tag_str(0, 0x12, str(folder_id))   # AirSync:CollectionId
         if date_from:
-            enc.tag_open(15, 0x1A)             # GreaterThan
+            enc.tag_open(15, 0x1B)             # GreaterThan
             enc.tag_empty(4, 0x27)             # Calendar:StartTime (field reference)
-            enc.tag_str(15, 0x11, to_iso(date_from))  # Value
+            enc.tag_str(15, 0x12, to_iso(date_from))  # Value
             enc.end()
         if date_to:
-            enc.tag_open(15, 0x19)             # LessThan
+            enc.tag_open(15, 0x1A)             # LessThan
             enc.tag_empty(4, 0x12)             # Calendar:EndTime (field reference)
-            enc.tag_str(15, 0x11, to_iso(date_to, end_of_day=True))  # Value
+            enc.tag_str(15, 0x12, to_iso(date_to, end_of_day=True))  # Value
             enc.end()
         enc.end()  # And
         enc.end()  # Query
 
-        enc.tag_open(15, 0x09)   # Options
-        enc.tag_str(15, 0x0A, f"0-{max_items - 1}")  # Range
+        enc.tag_open(15, 0x0A)   # Options
+        enc.tag_str(15, 0x0B, f"0-{max_items - 1}")  # Range
         enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
         enc.tag_str(17, 0x06, "1")         # Type = plain text
         enc.tag_str(17, 0x07, body_size)   # TruncationSize
