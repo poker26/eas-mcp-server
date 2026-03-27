@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict
 
 from eas_client import EASClient, FOLDER_TYPES
+from minio_storage import MinioStorage, MinioStorageConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +30,21 @@ EAS_EMAIL = os.environ.get("EAS_EMAIL", "")
 STATE_FILE = os.environ.get("STATE_FILE", "/app/eas_state.json")
 API_KEY = os.environ.get("API_KEY", "")
 YANDEX_MAPS_KEY = os.environ.get("YANDEX_MAPS_KEY", "")
+
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
+MINIO_BUCKET_MEDIA = os.environ.get("MINIO_BUCKET_MEDIA", "")
+MINIO_USE_SSL = os.environ.get("MINIO_USE_SSL", "true").strip().lower() in ("1", "true", "yes", "on")
+
+MINIO_CONFIG = MinioStorageConfig(
+    endpoint=MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    bucket_media=MINIO_BUCKET_MEDIA,
+    use_ssl=MINIO_USE_SSL,
+)
+MINIO_STORAGE = MinioStorage(MINIO_CONFIG)
 
 
 # ============================================================
@@ -56,6 +72,15 @@ async def app_lifespan(server):
     logger.info("Connecting to Exchange: %s as %s", EAS_HOST, EAS_USERNAME)
     folders = client.folder_sync()
     logger.info("Found %d folders", len(folders))
+
+    if MINIO_STORAGE.is_enabled():
+        try:
+            MINIO_STORAGE.ensure_bucket_exists()
+            logger.info("MinIO is enabled. Bucket ready: %s", MINIO_BUCKET_MEDIA)
+        except Exception as minio_error:
+            logger.warning("MinIO initialization failed: %s", minio_error)
+    else:
+        logger.info("MinIO is disabled (missing MINIO_* env vars)")
 
     yield {"eas": client}
 
