@@ -350,7 +350,8 @@ class EASClient:
 
     # --- Incremental sync ---
     def sync_incremental(self, collection_id: str, window_size: int = 50,
-                         body_type: str = "1", body_size: str = "51200") -> dict:
+                         body_type: str = "1", body_size: str = "51200",
+                         include_attachments: bool = False) -> dict:
         """Sync only new/changed items since last sync.
 
         Uses stored SyncKey. On first call, drains all existing items
@@ -373,7 +374,8 @@ class EASClient:
             total_drained = 0
             while True:
                 r = self.sync(collection_id, key, window_size=500,
-                             body_type="1", body_size="0")
+                             body_type="1", body_size="0",
+                             include_attachments=include_attachments)
                 new_key = r.get("sync_key")
                 status = r.get("status")
 
@@ -406,7 +408,8 @@ class EASClient:
 
         # Incremental: use stored key — only new items
         r = self.sync(collection_id, stored_key, window_size=window_size,
-                     body_type=body_type, body_size=body_size)
+                     body_type=body_type, body_size=body_size,
+                     include_attachments=include_attachments)
 
         new_key = r.get("sync_key")
         status = r.get("status")
@@ -477,7 +480,8 @@ class EASClient:
     # --- Sync ---
     def sync(self, collection_id: str, sync_key: str = "0",
              window_size: int = 50, body_type: str = "1",
-             body_size: str = "51200", filter_type: str = "") -> dict:
+             body_size: str = "51200", filter_type: str = "",
+             include_attachments: bool = False) -> dict:
         enc = WBXMLEncoder()
         enc.tag_open(0, 0x05)   # Sync
         enc.tag_open(0, 0x1C)   # Collections
@@ -495,6 +499,11 @@ class EASClient:
             enc.tag_str(17, 0x06, body_type)
             enc.tag_str(17, 0x07, body_size)
             enc.end()  # BodyPreference
+            if include_attachments:
+                # Request full MIME metadata so Exchange may include attachment
+                # descriptors (including FileReference) in Sync payload.
+                enc.tag_str(0, 0x22, "2")  # MIMESupport = BestBody
+                enc.tag_str(0, 0x23, "0")  # MIMETruncation = No truncation
             enc.end()  # Options
 
         enc.end()  # Collection

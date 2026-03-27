@@ -466,7 +466,13 @@ async def exchange_get_calendar(
             "exchange_get_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
             fid, date_from, date_to,
         )
-        fallback = client.sync_folder(fid, window_size=max_items, body_type="1", body_size="4096")
+        fallback = client.sync_folder(
+            fid,
+            window_size=max_items,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
         events = client.parse_calendar(fallback.get("elements", []))
 
     # Expand recurring events if a date range is specified
@@ -790,7 +796,13 @@ async def api_calendar(
             "api_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
             fid, df, dt,
         )
-        fallback = c.sync_folder(fid, window_size=max, body_type="1", body_size="4096")
+        fallback = c.sync_folder(
+            fid,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
         events = c.parse_calendar(fallback.get("elements", []))
 
     if df or dt:
@@ -889,7 +901,13 @@ async def api_new_events(
     _verify_key(x_api_key, authorization)
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
-    result = c.sync_incremental(fid, window_size=max, body_type="1", body_size="4096")
+    result = c.sync_incremental(
+        fid,
+        window_size=max,
+        body_type="1",
+        body_size="4096",
+        include_attachments=True,
+    )
     delta = c.parse_calendar_delta(result.get("elements", []))
     delta["added"] = _enrich_calendar_attachments_batch(c, delta["added"])
     delta["changed"] = _enrich_calendar_attachments_batch(c, delta["changed"])
@@ -1057,6 +1075,7 @@ async def exchange_get_new_events(
     result = client.sync_incremental(
         fid, window_size=max_items,
         body_type="1", body_size="4096",
+        include_attachments=True,
     )
 
     delta = client.parse_calendar_delta(result.get("elements", []))
