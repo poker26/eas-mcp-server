@@ -609,6 +609,7 @@ class EASClient:
         server_id: str,
         body_type: str = "1",
         body_size: str = "4096",
+        include_schema: bool = True,
     ) -> dict:
         """Fetch a single calendar item via ItemOperations/Fetch."""
         if not collection_id:
@@ -623,6 +624,27 @@ class EASClient:
         enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
         enc.tag_str(0, 0x0D, str(server_id))  # ServerId
         enc.tag_open(20, 0x08)   # Options
+        if include_schema:
+            # Explicitly request calendar and AirSyncBase fields so the server
+            # can return attachment metadata when it is available for the item.
+            enc.tag_open(20, 0x10)  # Schema
+            enc.tag_empty(4, 0x26)   # Calendar:Subject
+            enc.tag_empty(4, 0x27)   # Calendar:StartTime
+            enc.tag_empty(4, 0x12)   # Calendar:EndTime
+            enc.tag_empty(4, 0x17)   # Calendar:Location
+            enc.tag_empty(4, 0x28)   # Calendar:UID
+            enc.tag_empty(4, 0x1A)   # Calendar:Organizer_Name
+            enc.tag_empty(4, 0x19)   # Calendar:Organizer_Email
+            enc.tag_empty(4, 0x18)   # Calendar:MeetingStatus
+            enc.tag_empty(4, 0x07)   # Calendar:Attendees
+            enc.tag_empty(17, 0x0A)  # AirSyncBase:Body
+            enc.tag_empty(17, 0x0E)  # AirSyncBase:Attachments
+            enc.tag_empty(17, 0x0F)  # AirSyncBase:Attachment
+            enc.tag_empty(17, 0x10)  # AirSyncBase:DisplayName
+            enc.tag_empty(17, 0x11)  # AirSyncBase:FileReference
+            enc.tag_empty(17, 0x17)  # AirSyncBase:ContentType
+            enc.tag_empty(17, 0x16)  # AirSyncBase:NativeBodyType
+            enc.end()  # Schema
         enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
         enc.tag_str(17, 0x06, body_type)
         enc.tag_str(17, 0x07, body_size)
