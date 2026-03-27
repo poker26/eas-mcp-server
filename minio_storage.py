@@ -8,6 +8,7 @@ It introduces a lazy, optional storage layer for attachments/media.
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
+from urllib.parse import urlparse
 
 from minio import Minio
 from minio.error import S3Error
@@ -41,11 +42,22 @@ class MinioStorage:
 
     def _get_client(self) -> Minio:
         if self._client is None:
+            raw_endpoint = (self.config.endpoint or "").strip()
+            normalized_endpoint = raw_endpoint
+            secure_connection = self.config.use_ssl
+
+            if raw_endpoint.startswith(("http://", "https://")):
+                parsed_endpoint = urlparse(raw_endpoint)
+                normalized_endpoint = parsed_endpoint.netloc
+                secure_connection = parsed_endpoint.scheme.lower() == "https"
+            else:
+                normalized_endpoint = raw_endpoint
+
             self._client = Minio(
-                endpoint=self.config.endpoint,
+                endpoint=normalized_endpoint,
                 access_key=self.config.access_key,
                 secret_key=self.config.secret_key,
-                secure=self.config.use_ssl,
+                secure=secure_connection,
             )
         return self._client
 
