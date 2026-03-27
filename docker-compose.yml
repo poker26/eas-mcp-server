@@ -5,12 +5,22 @@ services:
     build: .
     container_name: eas-mcp-server
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - EAS_HOST=mail.inplatlabs.ru
       - EAS_USERNAME=${EAS_USERNAME}
       - EAS_PASSWORD=${EAS_PASSWORD}
       - EAS_DEVICE_ID=EAS0LEGCLIENT0001
       - EAS_PROTOCOL=14.1
+      - EAS_EMAIL=${EAS_EMAIL}
+      - API_KEY=${API_KEY}
+      - STATE_FILE=${STATE_FILE}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET_MEDIA=${MINIO_BUCKET_MEDIA}
+      - MINIO_USE_SSL=${MINIO_USE_SSL}
     ports:
       - "127.0.0.1:8900:8000"
     # Uncomment labels below if using Traefik reverse proxy
