@@ -762,8 +762,16 @@ async def api_new_events(
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
     result = c.sync_incremental(fid, window_size=max, body_type="1", body_size="4096")
-    events = c.parse_calendar(result.get("elements", []))
-    return {"events": events, "count": len(events), "is_initial": result.get("is_initial", False)}
+    delta = c.parse_calendar_delta(result.get("elements", []))
+    events = delta["added"] + delta["changed"]
+    return {
+        "events": events,  # backward compatibility
+        "added": delta["added"],
+        "changed": delta["changed"],
+        "deleted": delta["deleted"],
+        "count": len(events),
+        "is_initial": result.get("is_initial", False),
+    }
 
 
 @api.get("/api/attachment", tags=["Email"], summary="Download attachment")
@@ -921,10 +929,14 @@ async def exchange_get_new_events(
         body_type="1", body_size="4096",
     )
 
-    events = client.parse_calendar(result.get("elements", []))
+    delta = client.parse_calendar_delta(result.get("elements", []))
+    events = delta["added"] + delta["changed"]
 
     return json.dumps({
-        "events": events,
+        "events": events,  # backward compatibility
+        "added": delta["added"],
+        "changed": delta["changed"],
+        "deleted": delta["deleted"],
         "count": len(events),
         "is_initial": result.get("is_initial", False),
         "status": result.get("status"),

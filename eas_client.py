@@ -640,6 +640,89 @@ class EASClient:
             events.append(cur)
         return events
 
+    def parse_calendar_delta(self, elements: list) -> dict:
+        """Parse incremental Sync calendar response into added/changed/deleted buckets.
+
+        This parser keeps SyncKey logic untouched and only interprets response payload:
+        - Add/Change blocks become calendar items
+        - Delete blocks become tombstones with server_id (and uid if present)
+        """
+        mapping = {
+            "Subject": "subject", "StartTime": "start",
+            "EndTime": "end", "Location": "location",
+            "Organizer_Name": "organizer_name",
+            "Organizer_Email": "organizer_email",
+            "AllDayEvent": "all_day", "BusyStatus": "busy_status",
+            "Reminder": "reminder", "UID": "uid", "DtStamp": "stamp",
+            "MeetingStatus": "meeting_status",
+            "Recurrence_Type": "recurrence_type",
+            "Recurrence_Interval": "recurrence_interval",
+            "Recurrence_DayOfWeek": "recurrence_dayofweek",
+            "Recurrence_DayOfMonth": "recurrence_dayofmonth",
+            "Recurrence_WeekOfMonth": "recurrence_weekofmonth",
+            "Recurrence_MonthOfYear": "recurrence_monthofyear",
+            "Recurrence_Until": "recurrence_until",
+            "Recurrence_Occurrences": "recurrence_occurrences",
+        }
+
+        delta = {"added": [], "changed": [], "deleted": []}
+        current_operation = None
+        current_item = None
+
+        def flush_current_item():
+            nonlocal current_item, current_operation
+            if not current_item or not current_operation:
+                current_item = None
+                current_operation = None
+                return
+
+            if current_operation == "delete":
+                if current_item.get("server_id"):
+                    delta["deleted"].append({
+                        "server_id": current_item.get("server_id"),
+                        "uid": current_item.get("uid", ""),
+                    })
+            elif current_operation == "add":
+                if current_item.get("server_id") or current_item.get("subject") or current_item.get("start"):
+                    delta["added"].append(current_item)
+            elif current_operation == "change":
+                if current_item.get("server_id") or current_item.get("subject") or current_item.get("start"):
+                    delta["changed"].append(current_item)
+
+            current_item = None
+            current_operation = None
+
+        for _, tag, value in elements:
+            if tag in ("Add", "Change", "Delete") and value is None:
+                flush_current_item()
+                current_operation = tag.lower()
+                current_item = {}
+                continue
+
+            if current_operation is None:
+                continue
+
+            if tag == "ServerId" and value:
+                if current_item is None:
+                    current_item = {}
+                current_item["server_id"] = value
+                continue
+
+            if current_item is None or value is None:
+                continue
+
+            if tag == "Attendee_Name":
+                current_item.setdefault("attendees", []).append({"name": value})
+            elif tag == "Attendee_Email":
+                attendee_list = current_item.get("attendees", [])
+                if attendee_list:
+                    attendee_list[-1]["email"] = value
+            elif tag in mapping:
+                current_item[mapping[tag]] = value
+
+        flush_current_item()
+        return delta
+
     def expand_recurring(self, events: list, date_from: str, date_to: str) -> list:
         """Expand recurring events into individual instances for a date range.
         
