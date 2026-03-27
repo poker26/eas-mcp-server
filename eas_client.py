@@ -532,6 +532,76 @@ class EASClient:
 
         return {"status": status, "sync_key": new_key, "elements": elements}
 
+    def sync_fetch_item(
+        self,
+        collection_id: str,
+        server_id: str,
+        body_type: str = "1",
+        body_size: str = "51200",
+        include_attachments: bool = True,
+    ) -> dict:
+        """Fetch a single item from a collection using Sync/Fetch command."""
+        if not server_id:
+            return {"status": "error", "message": "server_id is required", "elements": []}
+
+        collection_key = str(collection_id)
+        active_sync_key = (
+            self.incr_keys.get(collection_key)
+            or self.sync_keys.get(collection_key)
+        )
+        if not active_sync_key:
+            baseline_response = self.sync(collection_id, "0")
+            active_sync_key = baseline_response.get("sync_key")
+            if not active_sync_key:
+                return {"status": "error", "message": "Failed to initialize SyncKey", "elements": []}
+
+        enc = WBXMLEncoder()
+        enc.tag_open(0, 0x05)  # Sync
+        enc.tag_open(0, 0x1C)  # Collections
+        enc.tag_open(0, 0x0F)  # Collection
+        enc.tag_str(0, 0x0B, active_sync_key)  # SyncKey
+        enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
+
+        enc.tag_open(0, 0x17)  # Options
+        enc.tag_open(17, 0x05)  # BodyPreference
+        enc.tag_str(17, 0x06, body_type)
+        enc.tag_str(17, 0x07, body_size)
+        enc.end()  # BodyPreference
+        if include_attachments:
+            enc.tag_str(0, 0x22, "2")  # MIMESupport
+            enc.tag_str(0, 0x23, "0")  # MIMETruncation
+        enc.end()  # Options
+
+        enc.tag_open(0, 0x16)  # Commands
+        enc.tag_open(0, 0x0A)  # Fetch
+        enc.tag_str(0, 0x0D, str(server_id))  # ServerId
+        enc.end()  # Fetch
+        enc.end()  # Commands
+
+        enc.end()  # Collection
+        enc.end()  # Collections
+        enc.end()  # Sync
+
+        response = self._post("Sync", enc.get())
+        if response.status_code != 200:
+            return {"status": f"HTTP {response.status_code}", "elements": []}
+        if not response.content:
+            return {"status": "empty", "sync_key": active_sync_key, "elements": []}
+
+        elements = self._decode(response)
+        status = self._find(elements, "Status")
+        updated_sync_key = self._find(elements, "SyncKey") or active_sync_key
+        self.sync_keys[collection_key] = updated_sync_key
+        self.incr_keys[collection_key] = updated_sync_key
+        self._save_state()
+
+        return {
+            "status": status,
+            "sync_key": updated_sync_key,
+            "elements": elements,
+            "requested_server_id": str(server_id),
+        }
+
     def sync_folder(self, collection_id: str, **kwargs) -> dict:
         """Full sync: fetches ALL items by looping until Exchange has no more."""
         r1 = self.sync(collection_id, "0")

@@ -1073,6 +1073,66 @@ async def api_debug_calendar_sync(
     }
 
 
+@api.get("/api/debug/calendar_item", tags=["Debug"], summary="Debug single calendar item fetch by ServerId")
+async def api_debug_calendar_item(
+    server_id: str = Query(..., description="Calendar item ServerId, e.g. 9:111"),
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Fetch a single calendar item via Sync/Fetch and return raw+parsed data."""
+    _verify_key(x_api_key, authorization)
+    client = _rest_client()
+    selected_folder_id = folder_id or client.find_folder(8)
+
+    if not selected_folder_id:
+        return {"error": "Calendar folder not found", "folder_id": selected_folder_id}
+
+    fetch_result = client.sync_fetch_item(
+        collection_id=selected_folder_id,
+        server_id=server_id,
+        body_type="1",
+        body_size="4096",
+        include_attachments=True,
+    )
+    raw_elements = fetch_result.get("elements", [])
+    parsed_events = client.parse_calendar(raw_elements)
+    selected_event = None
+    for event_payload in parsed_events:
+        if event_payload.get("server_id") == server_id:
+            selected_event = event_payload
+            break
+
+    return {
+        "request": {
+            "folder_id": selected_folder_id,
+            "server_id": server_id,
+            "body_type": "1",
+            "body_size": "4096",
+            "include_attachments": True,
+            "mime_support": "2",
+            "mime_truncation": "0",
+        },
+        "fetch_meta": {
+            "status": fetch_result.get("status"),
+            "sync_key": fetch_result.get("sync_key"),
+            "requested_server_id": fetch_result.get("requested_server_id"),
+            "raw_elements_count": len(raw_elements),
+            "parsed_events_count": len(parsed_events),
+        },
+        "event": selected_event,
+        "raw_tag_stats": _collect_exchange_tag_statistics(raw_elements),
+        "raw_elements_preview": [
+            {
+                "depth": depth,
+                "tag": tag,
+                "value": value if not isinstance(value, str) or len(value) <= 200 else value[:200] + "...<truncated>",
+            }
+            for depth, tag, value in raw_elements[:500]
+        ],
+    }
+
+
 @api.get("/api/attachment", tags=["Email"], summary="Download attachment")
 async def api_get_attachment(
     file_reference: str = Query(..., description="FileReference from email attachment metadata"),
