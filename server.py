@@ -975,6 +975,8 @@ async def api_debug_calendar_sync(
     folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
     mode: str = Query("incremental", description="incremental or snapshot"),
     max: int = Query(50, ge=1, le=200, description="Window size for Sync"),
+    subject: str = Query("", description="Optional exact subject to locate in raw tags"),
+    preview_limit: int = Query(250, ge=50, le=5000, description="Number of raw elements to include in preview"),
     x_api_key: str = Header(default=None),
     authorization: str = Header(default=None),
 ):
@@ -1017,6 +1019,22 @@ async def api_debug_calendar_sync(
     raw_elements = sync_result.get("elements", [])
     parsed_delta = client.parse_calendar_delta(raw_elements)
 
+    subject_windows = []
+    target_subject = (subject or "").strip()
+    if target_subject:
+        for index, (depth, tag, value) in enumerate(raw_elements):
+            if tag == "Subject" and value == target_subject:
+                start_index = max(0, index - 25)
+                end_index = min(len(raw_elements), index + 50)
+                subject_windows.append([
+                    {
+                        "depth": depth_value,
+                        "tag": tag_value,
+                        "value": raw_value if not isinstance(raw_value, str) or len(raw_value) <= 200 else raw_value[:200] + "...<truncated>",
+                    }
+                    for depth_value, tag_value, raw_value in raw_elements[start_index:end_index]
+                ])
+
     return {
         "request": {
             "folder_id": selected_folder_id,
@@ -1039,13 +1057,18 @@ async def api_debug_calendar_sync(
             "deleted": len(parsed_delta.get("deleted", [])),
         },
         "raw_tag_stats": _collect_exchange_tag_statistics(raw_elements),
+        "subject_search": {
+            "target_subject": target_subject,
+            "hits": len(subject_windows),
+            "windows": subject_windows[:8],
+        },
         "raw_elements_preview": [
             {
                 "depth": depth,
                 "tag": tag,
                 "value": value if not isinstance(value, str) or len(value) <= 200 else value[:200] + "...<truncated>",
             }
-            for depth, tag, value in raw_elements[:250]
+            for depth, tag, value in raw_elements[:preview_limit]
         ],
     }
 
