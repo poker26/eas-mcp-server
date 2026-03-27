@@ -165,6 +165,24 @@ def _build_attachment_object_key(event_payload: dict, attachment_payload: dict) 
     return f"exchange/calendar/{event_identifier}/{reference_hash}-{attachment_name}"
 
 
+def _build_email_attachment_object_key(email_payload: dict, attachment_payload: dict) -> str:
+    email_identifier = _sanitize_storage_part(
+        str(email_payload.get("server_id") or email_payload.get("message_class") or "email"),
+        "email",
+    )
+    source_file_reference = str(attachment_payload.get("file_reference") or "")
+    reference_hash = hashlib.sha1(source_file_reference.encode("utf-8")).hexdigest()[:16]
+    attachment_name = _sanitize_storage_part(
+        str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or "attachment.bin"
+        ),
+        "attachment.bin",
+    )
+    return f"exchange/email/{email_identifier}/{reference_hash}-{attachment_name}"
+
+
 def _enrich_calendar_event_attachments(client: EASClient, event_payload: dict) -> dict:
     if not MINIO_STORAGE.is_enabled():
         return event_payload
@@ -260,6 +278,70 @@ def _enrich_calendar_attachments_batch(client: EASClient, events: list) -> list:
     for event_payload in events:
         _enrich_calendar_event_attachments(client, event_payload)
     return events
+
+
+def _enrich_email_attachments_batch(client: EASClient, emails: list) -> list:
+    if not MINIO_STORAGE.is_enabled():
+        return emails
+
+    for email_payload in emails:
+        attachment_list = email_payload.get("attachments")
+        if not isinstance(attachment_list, list) or not attachment_list:
+            continue
+
+        for attachment_payload in attachment_list:
+            file_reference = str(attachment_payload.get("file_reference") or "").strip()
+            if not file_reference:
+                continue
+
+            object_key = _build_email_attachment_object_key(email_payload, attachment_payload)
+            attachment_payload["storage_bucket"] = MINIO_BUCKET_MEDIA
+            attachment_payload["storage_object_key"] = object_key
+
+            try:
+                if MINIO_STORAGE.object_exists(object_key):
+                    attachment_payload["storage_status"] = "cached"
+                    attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+                    continue
+
+                attachment_response = client.get_attachment(file_reference)
+                if attachment_response.get("status") != "ok":
+                    attachment_payload["storage_status"] = "download_error"
+                    attachment_payload["storage_error"] = attachment_response.get("status", "unknown")
+                    continue
+
+                raw_data = attachment_response.get("data")
+                if not raw_data:
+                    attachment_payload["storage_status"] = "empty_payload"
+                    continue
+
+                attachment_bytes = base64.b64decode(raw_data)
+                content_type = str(
+                    attachment_payload.get("content_type")
+                    or attachment_response.get("content_type")
+                    or "application/octet-stream"
+                )
+                MINIO_STORAGE.upload_bytes(
+                    object_key=object_key,
+                    payload=attachment_bytes,
+                    content_type=content_type,
+                )
+
+                attachment_payload["storage_status"] = "uploaded"
+                attachment_payload["content_type"] = content_type
+                attachment_payload["size_bytes"] = len(attachment_bytes)
+                attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+            except Exception as storage_error:
+                attachment_payload["storage_status"] = "storage_error"
+                attachment_payload["storage_error"] = str(storage_error)
+                logger.warning(
+                    "Attachment MinIO enrichment failed for email=%s file_reference=%s error=%s",
+                    email_payload.get("server_id", ""),
+                    file_reference,
+                    storage_error,
+                )
+
+    return emails
 
 
 def _collect_exchange_tag_statistics(elements: list, max_windows: int = 12) -> dict:
@@ -472,6 +554,7 @@ async def exchange_get_emails(folder_id: str = None, max_items: int = 25, includ
         }, ensure_ascii=False)
 
     emails = client.parse_emails(result["elements"])
+    emails = _enrich_email_attachments_batch(client, emails)
 
     # Trim to max
     emails = emails[:max_items]
@@ -497,6 +580,10 @@ async def exchange_get_emails(folder_id: str = None, max_items: int = 25, includ
             item["preview"] = e["preview"]
         if e.get("thread_topic"):
             item["thread_topic"] = e["thread_topic"]
+        if e.get("message_class"):
+            item["message_class"] = e["message_class"]
+        if e.get("attachments"):
+            item["attachments"] = e["attachments"]
         output.append(item)
 
     return json.dumps({
@@ -819,13 +906,17 @@ async def api_emails(
     fid = folder_id or c.find_folder(2)
     body_size = "51200" if body else "0"
     r = c.sync_folder(fid, window_size=max, body_type="1", body_size=body_size)
-    emails = c.parse_emails(r.get("elements", []))[:max]
+    emails = c.parse_emails(r.get("elements", []))
+    emails = _enrich_email_attachments_batch(c, emails)
+    emails = emails[:max]
     output = []
     for e in emails:
         item = {"subject": e.get("subject", ""), "from": e.get("from", ""), "to": e.get("to", ""), "date": e.get("date", ""), "read": e.get("read", "0") == "1"}
         if e.get("cc"): item["cc"] = e["cc"]
         if body and e.get("body"): item["body"] = e["body"]
         if e.get("preview"): item["preview"] = e["preview"]
+        if e.get("message_class"): item["message_class"] = e["message_class"]
+        if e.get("attachments"): item["attachments"] = e["attachments"]
         output.append(item)
     return {"emails": output, "count": len(output)}
 
@@ -974,12 +1065,15 @@ async def api_new_emails(
     body_size = "51200" if body else "0"
     result = c.sync_incremental(fid, window_size=max, body_type="1", body_size=body_size)
     emails = c.parse_emails(result.get("elements", []))
+    emails = _enrich_email_attachments_batch(c, emails)
     output = []
     for e in emails:
         item = {"subject": e.get("subject",""), "from": e.get("from",""), "to": e.get("to",""), "date": e.get("date",""), "read": e.get("read","0") == "1"}
         if e.get("cc"): item["cc"] = e["cc"]
         if body and e.get("body"): item["body"] = e["body"]
         if e.get("preview"): item["preview"] = e["preview"]
+        if e.get("message_class"): item["message_class"] = e["message_class"]
+        if e.get("attachments"): item["attachments"] = e["attachments"]
         output.append(item)
     return {"emails": output, "count": len(output), "is_initial": result.get("is_initial", False)}
 
@@ -1298,6 +1392,7 @@ async def exchange_get_new_emails(
     )
 
     emails = client.parse_emails(result.get("elements", []))
+    emails = _enrich_email_attachments_batch(client, emails)
 
     output = []
     for e in emails:
@@ -1311,6 +1406,8 @@ async def exchange_get_new_emails(
         if e.get("cc"): item["cc"] = e["cc"]
         if include_body and e.get("body"): item["body"] = e["body"]
         if e.get("preview"): item["preview"] = e["preview"]
+        if e.get("message_class"): item["message_class"] = e["message_class"]
+        if e.get("attachments"): item["attachments"] = e["attachments"]
         output.append(item)
 
     return json.dumps({

@@ -740,9 +740,20 @@ class EASClient:
     def parse_emails(self, elements: list) -> list:
         emails = []
         cur = {}
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
+                item.setdefault("attachments", []).append(pending_attachment)
+
         for _, tag, value in elements:
             if tag == "ServerId" and value:
                 if cur.get("subject") or cur.get("from"):
+                    flush_pending_attachment(cur)
                     emails.append(cur)
                 cur = {"server_id": value}
                 continue
@@ -751,16 +762,41 @@ class EASClient:
                     "Subject": "subject", "From": "from", "To": "to",
                     "Cc": "cc", "DateReceived": "date",
                     "DisplayTo": "display_to", "Importance": "importance",
-                    "Read": "read", "MessageClass": "class",
+                    "Read": "read",
                     "Data": "body", "Preview": "preview",
-                    "EstimatedDataSize": "size", "ThreadTopic": "thread_topic",
-                    "FileReference": "file_reference",
-                    "DisplayName": "att_display_name",
-                    "AttName": "att_name",
+                    "ThreadTopic": "thread_topic",
                 }
-                if tag in mapping:
+                if tag == "MessageClass":
+                    cur["message_class"] = value
+                    cur["class"] = value  # backward compatibility
+                elif tag == "FileReference":
+                    pending_attachment = cur.get("_pending_attachment")
+                    if pending_attachment and pending_attachment.get("file_reference"):
+                        cur.setdefault("attachments", []).append(pending_attachment)
+                        pending_attachment = {}
+                    if pending_attachment is None:
+                        pending_attachment = {}
+                    pending_attachment["file_reference"] = value
+                    cur["_pending_attachment"] = pending_attachment
+                elif tag in ("DisplayName", "AttName", "AttSize", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+                    attachment_field_mapping = {
+                        "DisplayName": "display_name",
+                        "AttName": "name",
+                        "AttSize": "size",
+                        "EstimatedDataSize": "estimated_size",
+                        "ContentType": "content_type",
+                        "Method": "method",
+                        "IsInline": "is_inline",
+                    }
+                    pending_attachment = cur.get("_pending_attachment")
+                    if pending_attachment is None:
+                        pending_attachment = {}
+                    pending_attachment[attachment_field_mapping[tag]] = value
+                    cur["_pending_attachment"] = pending_attachment
+                elif tag in mapping:
                     cur[mapping[tag]] = value
         if cur.get("subject") or cur.get("from"):
+            flush_pending_attachment(cur)
             emails.append(cur)
         return emails
 
