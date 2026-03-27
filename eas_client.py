@@ -602,6 +602,62 @@ class EASClient:
             "requested_server_id": str(server_id),
         }
 
+    def item_operations_fetch_calendar_item(
+        self,
+        collection_id: str,
+        server_id: str,
+        body_type: str = "1",
+        body_size: str = "4096",
+    ) -> dict:
+        """Fetch a single calendar item via ItemOperations/Fetch."""
+        if not collection_id:
+            return {"status": "error", "message": "collection_id is required", "elements": []}
+        if not server_id:
+            return {"status": "error", "message": "server_id is required", "elements": []}
+
+        enc = WBXMLEncoder()
+        enc.tag_open(14, 0x05)   # ItemOperations
+        enc.tag_open(14, 0x06)   # Fetch
+        enc.tag_str(14, 0x07, "Mailbox")  # Store
+        enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
+        enc.tag_str(0, 0x0D, str(server_id))  # ServerId
+        enc.tag_open(14, 0x08)   # Options
+        enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
+        enc.tag_str(17, 0x06, body_type)
+        enc.tag_str(17, 0x07, body_size)
+        enc.end()  # BodyPreference
+        enc.end()  # Options
+        enc.end()  # Fetch
+        enc.end()  # ItemOperations
+
+        response = self._post("ItemOperations", enc.get())
+        if response.status_code != 200:
+            return {"status": f"HTTP {response.status_code}", "elements": []}
+        if not response.content:
+            return {"status": "empty", "elements": []}
+
+        elements = self._decode(response)
+        top_level_status = self._find(elements, "Status")
+        fetch_status = None
+        inside_fetch = False
+        for _, tag, value in elements:
+            if tag == "Fetch" and value is None:
+                inside_fetch = True
+                continue
+            if inside_fetch and tag == "Status" and value is not None:
+                fetch_status = value
+                break
+
+        status = fetch_status or top_level_status
+        return {
+            "status": status,
+            "top_level_status": top_level_status,
+            "fetch_status": fetch_status,
+            "elements": elements,
+            "requested_server_id": str(server_id),
+            "collection_id": str(collection_id),
+        }
+
     def sync_folder(self, collection_id: str, **kwargs) -> dict:
         """Full sync: fetches ALL items by looping until Exchange has no more."""
         r1 = self.sync(collection_id, "0")

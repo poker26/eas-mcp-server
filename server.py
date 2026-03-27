@@ -1080,7 +1080,7 @@ async def api_debug_calendar_item(
     x_api_key: str = Header(default=None),
     authorization: str = Header(default=None),
 ):
-    """Fetch a single calendar item via Sync/Fetch and return raw+parsed data."""
+    """Fetch a single calendar item via ItemOperations/Fetch and return raw+parsed data."""
     _verify_key(x_api_key, authorization)
     client = _rest_client()
     selected_folder_id = folder_id or client.find_folder(8)
@@ -1088,12 +1088,11 @@ async def api_debug_calendar_item(
     if not selected_folder_id:
         return {"error": "Calendar folder not found", "folder_id": selected_folder_id}
 
-    fetch_result = client.sync_fetch_item(
+    fetch_result = client.item_operations_fetch_calendar_item(
         collection_id=selected_folder_id,
         server_id=server_id,
         body_type="1",
         body_size="4096",
-        include_attachments=True,
     )
     raw_elements = fetch_result.get("elements", [])
     parsed_events = client.parse_calendar(raw_elements)
@@ -1107,15 +1106,15 @@ async def api_debug_calendar_item(
         "request": {
             "folder_id": selected_folder_id,
             "server_id": server_id,
+            "command": "ItemOperations",
+            "operation": "Fetch",
             "body_type": "1",
             "body_size": "4096",
-            "include_attachments": True,
-            "mime_support": "2",
-            "mime_truncation": "0",
         },
         "fetch_meta": {
             "status": fetch_result.get("status"),
-            "sync_key": fetch_result.get("sync_key"),
+            "top_level_status": fetch_result.get("top_level_status"),
+            "fetch_status": fetch_result.get("fetch_status"),
             "requested_server_id": fetch_result.get("requested_server_id"),
             "raw_elements_count": len(raw_elements),
             "parsed_events_count": len(parsed_events),
