@@ -321,6 +321,24 @@ def _enrich_email_attachments_batch(client: EASClient, emails: list) -> list:
                     or attachment_response.get("content_type")
                     or "application/octet-stream"
                 )
+                attachment_name = str(
+                    attachment_payload.get("display_name")
+                    or attachment_payload.get("name")
+                    or ""
+                ).lower()
+                is_ical_attachment = (
+                    "text/calendar" in content_type.lower()
+                    or attachment_name.endswith(".ics")
+                )
+                if is_ical_attachment:
+                    try:
+                        attachment_payload["ics"] = attachment_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        logger.warning(
+                            "Unable to decode ICS attachment for email=%s file_reference=%s",
+                            email_payload.get("server_id", ""),
+                            file_reference,
+                        )
                 MINIO_STORAGE.upload_bytes(
                     object_key=object_key,
                     payload=attachment_bytes,
@@ -342,6 +360,167 @@ def _enrich_email_attachments_batch(client: EASClient, emails: list) -> list:
                 )
 
     return emails
+
+
+def _normalize_ical_lines(ics_text: str) -> list:
+    """Return unfolded iCalendar lines (RFC 5545 line folding support)."""
+    raw_lines = (ics_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    unfolded_lines = []
+    for raw_line in raw_lines:
+        if not raw_line:
+            continue
+        if raw_line.startswith((" ", "\t")) and unfolded_lines:
+            unfolded_lines[-1] += raw_line[1:]
+        else:
+            unfolded_lines.append(raw_line)
+    return unfolded_lines
+
+
+def _extract_ics_invite_data(ics_text: str) -> dict:
+    """Extract a compact invite payload from VCALENDAR/VEVENT."""
+    unfolded_lines = _normalize_ical_lines(ics_text)
+    if not unfolded_lines:
+        return {}
+
+    in_vevent = False
+    invite_data = {}
+    method_value = ""
+
+    for line in unfolded_lines:
+        if ":" not in line:
+            continue
+        raw_name, raw_value = line.split(":", 1)
+        field_name = raw_name.split(";", 1)[0].strip().upper()
+        field_value = raw_value.strip()
+
+        if field_name == "BEGIN" and field_value.upper() == "VEVENT":
+            in_vevent = True
+            continue
+        if field_name == "END" and field_value.upper() == "VEVENT":
+            in_vevent = False
+            continue
+
+        if field_name == "METHOD":
+            method_value = field_value.upper()
+            continue
+
+        if not in_vevent:
+            continue
+
+        if field_name == "UID":
+            invite_data["uid"] = field_value
+        elif field_name == "SEQUENCE":
+            invite_data["sequence"] = field_value
+        elif field_name == "RECURRENCE-ID":
+            invite_data["recurrence_id"] = field_value
+        elif field_name == "DTSTART":
+            invite_data["start"] = field_value
+        elif field_name == "DTEND":
+            invite_data["end"] = field_value
+        elif field_name == "SUMMARY":
+            invite_data["summary"] = field_value
+        elif field_name == "LOCATION":
+            invite_data["location"] = field_value
+        elif field_name == "STATUS":
+            invite_data["status"] = field_value
+        elif field_name == "ORGANIZER":
+            invite_data["organizer"] = field_value
+
+    if method_value:
+        invite_data["method"] = method_value
+
+    return invite_data
+
+
+def _detect_email_kind(message_class_value: str) -> str:
+    normalized_class = str(message_class_value or "").strip().upper()
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.REQUEST"):
+        return "meeting_invite"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.CANCELED"):
+        return "meeting_cancel"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.RESP"):
+        return "meeting_response"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING."):
+        return "meeting_update"
+    return "email"
+
+
+def _build_meeting_dedupe_key(meeting_payload: dict) -> str:
+    uid_value = str(meeting_payload.get("uid") or "")
+    sequence_value = str(meeting_payload.get("sequence") or "0")
+    recurrence_id_value = str(meeting_payload.get("recurrence_id") or "")
+    method_value = str(meeting_payload.get("method") or "")
+    if not uid_value:
+        return ""
+    return "|".join([uid_value, sequence_value, recurrence_id_value, method_value])
+
+
+def _extract_meeting_invite_payload(email_payload: dict) -> dict:
+    attachment_list = email_payload.get("attachments")
+    if not isinstance(attachment_list, list):
+        return {}
+
+    for attachment_payload in attachment_list:
+        content_type = str(attachment_payload.get("content_type") or "").lower()
+        display_name = str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or ""
+        ).lower()
+
+        looks_like_ics = (
+            "text/calendar" in content_type
+            or display_name.endswith(".ics")
+        )
+        if not looks_like_ics:
+            continue
+
+        raw_ics = attachment_payload.get("ics")
+        if not raw_ics:
+            continue
+
+        parsed_invite = _extract_ics_invite_data(str(raw_ics))
+        if not parsed_invite:
+            continue
+
+        parsed_invite["ics"] = raw_ics
+        return parsed_invite
+
+    return {}
+
+
+def _shape_email_output(email_payload: dict, include_body: bool) -> dict:
+    output_item = {
+        "subject": email_payload.get("subject", ""),
+        "from": email_payload.get("from", ""),
+        "to": email_payload.get("to", ""),
+        "date": email_payload.get("date", ""),
+        "read": email_payload.get("read", "0") == "1",
+    }
+    if email_payload.get("cc"):
+        output_item["cc"] = email_payload["cc"]
+    if include_body and email_payload.get("body"):
+        output_item["body"] = email_payload["body"]
+    if email_payload.get("preview"):
+        output_item["preview"] = email_payload["preview"]
+    if email_payload.get("thread_topic"):
+        output_item["thread_topic"] = email_payload["thread_topic"]
+    if email_payload.get("message_class"):
+        output_item["message_class"] = email_payload["message_class"]
+    if email_payload.get("attachments"):
+        output_item["attachments"] = email_payload["attachments"]
+
+    email_kind = _detect_email_kind(email_payload.get("message_class", ""))
+    output_item["email_kind"] = email_kind
+
+    meeting_payload = _extract_meeting_invite_payload(email_payload)
+    if meeting_payload:
+        output_item["meeting"] = meeting_payload
+        dedupe_key = _build_meeting_dedupe_key(meeting_payload)
+        if dedupe_key:
+            output_item["dedupe_key"] = dedupe_key
+
+    return output_item
 
 
 def _collect_exchange_tag_statistics(elements: list, max_windows: int = 12) -> dict:
@@ -561,29 +740,11 @@ async def exchange_get_emails(folder_id: str = None, max_items: int = 25, includ
 
     # Clean up for output
     output = []
-    for e in emails:
-        item = {
-            "subject": e.get("subject", "(no subject)"),
-            "from": e.get("from", ""),
-            "to": e.get("to", ""),
-            "date": e.get("date", ""),
-            "read": e.get("read", "0") == "1",
-        }
-        if e.get("cc"):
-            item["cc"] = e["cc"]
-        if e.get("importance"):
+    for email_payload in emails:
+        item = _shape_email_output(email_payload, include_body)
+        if email_payload.get("importance"):
             item["importance"] = {"0": "low", "1": "normal", "2": "high"}.get(
-                e["importance"], e["importance"])
-        if include_body and e.get("body"):
-            item["body"] = e["body"]
-        if e.get("preview"):
-            item["preview"] = e["preview"]
-        if e.get("thread_topic"):
-            item["thread_topic"] = e["thread_topic"]
-        if e.get("message_class"):
-            item["message_class"] = e["message_class"]
-        if e.get("attachments"):
-            item["attachments"] = e["attachments"]
+                email_payload["importance"], email_payload["importance"])
         output.append(item)
 
     return json.dumps({
@@ -910,14 +1071,8 @@ async def api_emails(
     emails = _enrich_email_attachments_batch(c, emails)
     emails = emails[:max]
     output = []
-    for e in emails:
-        item = {"subject": e.get("subject", ""), "from": e.get("from", ""), "to": e.get("to", ""), "date": e.get("date", ""), "read": e.get("read", "0") == "1"}
-        if e.get("cc"): item["cc"] = e["cc"]
-        if body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        if e.get("message_class"): item["message_class"] = e["message_class"]
-        if e.get("attachments"): item["attachments"] = e["attachments"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, body))
     return {"emails": output, "count": len(output)}
 
 
@@ -1067,14 +1222,8 @@ async def api_new_emails(
     emails = c.parse_emails(result.get("elements", []))
     emails = _enrich_email_attachments_batch(c, emails)
     output = []
-    for e in emails:
-        item = {"subject": e.get("subject",""), "from": e.get("from",""), "to": e.get("to",""), "date": e.get("date",""), "read": e.get("read","0") == "1"}
-        if e.get("cc"): item["cc"] = e["cc"]
-        if body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        if e.get("message_class"): item["message_class"] = e["message_class"]
-        if e.get("attachments"): item["attachments"] = e["attachments"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, body))
     return {"emails": output, "count": len(output), "is_initial": result.get("is_initial", False)}
 
 
@@ -1395,20 +1544,8 @@ async def exchange_get_new_emails(
     emails = _enrich_email_attachments_batch(client, emails)
 
     output = []
-    for e in emails:
-        item = {
-            "subject": e.get("subject", ""),
-            "from": e.get("from", ""),
-            "to": e.get("to", ""),
-            "date": e.get("date", ""),
-            "read": e.get("read", "0") == "1",
-        }
-        if e.get("cc"): item["cc"] = e["cc"]
-        if include_body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        if e.get("message_class"): item["message_class"] = e["message_class"]
-        if e.get("attachments"): item["attachments"] = e["attachments"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, include_body))
 
     return json.dumps({
         "emails": output,
