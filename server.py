@@ -216,6 +216,54 @@ def _enrich_calendar_attachments_batch(client: EASClient, events: list) -> list:
     return events
 
 
+def _collect_exchange_tag_statistics(elements: list, max_windows: int = 12) -> dict:
+    interesting_tags = {
+        "Attachments",
+        "Attachment",
+        "FileReference",
+        "DisplayName",
+        "AttName",
+        "AttSize",
+        "EstimatedDataSize",
+        "ContentType",
+        "Method",
+        "IsInline",
+        "Body",
+        "BodyPreference",
+        "ApplicationData",
+        "ServerId",
+        "Subject",
+    }
+
+    tag_counts = {}
+    attachment_windows = []
+
+    for index, (depth, tag, value) in enumerate(elements):
+        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        if tag in interesting_tags and len(attachment_windows) < max_windows:
+            start_index = max(0, index - 4)
+            end_index = min(len(elements), index + 5)
+            window = []
+            for depth_value, tag_value, raw_value in elements[start_index:end_index]:
+                normalized_value = raw_value
+                if isinstance(normalized_value, str) and len(normalized_value) > 160:
+                    normalized_value = normalized_value[:160] + "...<truncated>"
+                window.append({
+                    "depth": depth_value,
+                    "tag": tag_value,
+                    "value": normalized_value,
+                })
+            attachment_windows.append(window)
+
+    sorted_counts = sorted(tag_counts.items(), key=lambda pair: pair[1], reverse=True)
+    return {
+        "total_elements": len(elements),
+        "top_tags": sorted_counts[:40],
+        "attachment_related_windows": attachment_windows,
+    }
+
+
 # ============================================================
 # Input Models
 # ============================================================
@@ -919,6 +967,86 @@ async def api_new_events(
         "deleted": delta["deleted"],
         "count": len(events),
         "is_initial": result.get("is_initial", False),
+    }
+
+
+@api.get("/api/debug/calendar_sync", tags=["Debug"], summary="Debug raw calendar Sync payload")
+async def api_debug_calendar_sync(
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    mode: str = Query("incremental", description="incremental or snapshot"),
+    max: int = Query(50, ge=1, le=200, description="Window size for Sync"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Return raw Exchange Sync tags for calendar troubleshooting.
+
+    This endpoint is for protocol diagnostics only. It helps verify which exact
+    WBXML tags Exchange returned (including attachment-related fields).
+    """
+    _verify_key(x_api_key, authorization)
+    client = _rest_client()
+    selected_folder_id = folder_id or client.find_folder(8)
+
+    if not selected_folder_id:
+        return {
+            "error": "Calendar folder not found",
+            "folder_id": selected_folder_id,
+        }
+
+    normalized_mode = (mode or "incremental").strip().lower()
+    if normalized_mode not in ("incremental", "snapshot"):
+        raise HTTPException(status_code=400, detail="mode must be 'incremental' or 'snapshot'")
+
+    if normalized_mode == "snapshot":
+        sync_result = client.sync_folder(
+            selected_folder_id,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+    else:
+        sync_result = client.sync_incremental(
+            selected_folder_id,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+
+    raw_elements = sync_result.get("elements", [])
+    parsed_delta = client.parse_calendar_delta(raw_elements)
+
+    return {
+        "request": {
+            "folder_id": selected_folder_id,
+            "mode": normalized_mode,
+            "window_size": max,
+            "body_type": "1",
+            "body_size": "4096",
+            "include_attachments": True,
+            "mime_support": "2",
+            "mime_truncation": "0",
+        },
+        "sync_meta": {
+            "status": sync_result.get("status"),
+            "sync_key": sync_result.get("sync_key"),
+            "is_initial": sync_result.get("is_initial", False),
+        },
+        "parsed_counts": {
+            "added": len(parsed_delta.get("added", [])),
+            "changed": len(parsed_delta.get("changed", [])),
+            "deleted": len(parsed_delta.get("deleted", [])),
+        },
+        "raw_tag_stats": _collect_exchange_tag_statistics(raw_elements),
+        "raw_elements_preview": [
+            {
+                "depth": depth,
+                "tag": tag,
+                "value": value if not isinstance(value, str) or len(value) <= 200 else value[:200] + "...<truncated>",
+            }
+            for depth, tag, value in raw_elements[:250]
+        ],
     }
 
 

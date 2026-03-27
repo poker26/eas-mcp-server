@@ -30,6 +30,7 @@ CP_AIRSYNC = {
     0x17: "Options", 0x18: "FilterType", 0x1B: "Conflict",
     0x1C: "Collections", 0x1D: "ApplicationData",
     0x1E: "DeletesAsMoves", 0x22: "MIMESupport",
+    0x23: "MIMETruncation",
 }
 
 CP_CONTACTS = {
