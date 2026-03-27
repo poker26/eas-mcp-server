@@ -144,7 +144,7 @@ CP_SEARCH = {
     0x23: "MaxPictures",
 }
 
-# Page 14: ItemOperations
+# Page 20: ItemOperations
 CP_ITEMOPS = {
     0x05: "ItemOperations", 0x06: "Fetch", 0x07: "Store",
     0x08: "Options", 0x09: "Range", 0x0A: "Total",
@@ -158,7 +158,8 @@ ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
     4: CP_CALENDAR, 7: CP_FOLDER,
     13: CP_SEARCH,  # defensive alias (expected: Ping)
-    14: CP_ITEMOPS, 15: CP_SEARCH, 17: CP_AIRSYNCBASE,
+    14: CP_ITEMOPS,  # defensive alias (expected: Provision)
+    15: CP_SEARCH, 17: CP_AIRSYNCBASE, 20: CP_ITEMOPS,
 }
 
 FOLDER_TYPES = {
@@ -616,12 +617,12 @@ class EASClient:
             return {"status": "error", "message": "server_id is required", "elements": []}
 
         enc = WBXMLEncoder()
-        enc.tag_open(14, 0x05)   # ItemOperations
-        enc.tag_open(14, 0x06)   # Fetch
-        enc.tag_str(14, 0x07, "Mailbox")  # Store
+        enc.tag_open(20, 0x05)   # ItemOperations
+        enc.tag_open(20, 0x06)   # Fetch
+        enc.tag_str(20, 0x07, "Mailbox")  # Store
         enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
         enc.tag_str(0, 0x0D, str(server_id))  # ServerId
-        enc.tag_open(14, 0x08)   # Options
+        enc.tag_open(20, 0x08)   # Options
         enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
         enc.tag_str(17, 0x06, body_type)
         enc.tag_str(17, 0x07, body_size)
@@ -1171,12 +1172,12 @@ class EASClient:
         import base64 as b64module
 
         enc = WBXMLEncoder()
-        # <ItemOperations> page 14, tag 0x05
-        enc.tag_open(14, 0x05)
+        # <ItemOperations> page 20, tag 0x05
+        enc.tag_open(20, 0x05)
         # <Fetch> tag 0x06
-        enc.tag_open(14, 0x06)
+        enc.tag_open(20, 0x06)
         # <Store> tag 0x07
-        enc.tag_str(14, 0x07, "Mailbox")
+        enc.tag_str(20, 0x07, "Mailbox")
         # <FileReference> - AirSyncBase page 17, tag 0x11
         enc.tag_str(17, 0x11, file_reference)
         enc.end()  # Fetch
