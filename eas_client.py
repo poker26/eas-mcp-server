@@ -89,6 +89,11 @@ CP_CALENDAR = {
     0x24: "Reminder", 0x25: "Sensitivity", 0x26: "Subject",
     0x27: "StartTime", 0x28: "UID",
     0x29: "Attendee_Status", 0x2A: "Attendee_Type",
+    # Extended calendar fields (EAS 14+)
+    0x33: "DisallowNewTimeProposal",
+    0x34: "ResponseRequested",
+    0x35: "AppointmentReplyTime",
+    0x36: "ResponseType",
 }
 
 CP_FOLDER = {
@@ -648,6 +653,10 @@ class EASClient:
                 "Recurrence_MonthOfYear": "recurrence_monthofyear",
                 "Recurrence_Until": "recurrence_until",
                 "Recurrence_Occurrences": "recurrence_occurrences",
+                "DisallowNewTimeProposal": "disallow_new_time_proposal",
+                "ResponseRequested": "response_requested",
+                "AppointmentReplyTime": "appointment_reply_time",
+                "ResponseType": "response_type",
             }
             if tag == "Attendee_Name":
                 cur.setdefault("attendees", []).append({"name": value})
@@ -712,6 +721,10 @@ class EASClient:
             "Recurrence_MonthOfYear": "recurrence_monthofyear",
             "Recurrence_Until": "recurrence_until",
             "Recurrence_Occurrences": "recurrence_occurrences",
+            "DisallowNewTimeProposal": "disallow_new_time_proposal",
+            "ResponseRequested": "response_requested",
+            "AppointmentReplyTime": "appointment_reply_time",
+            "ResponseType": "response_type",
         }
 
         delta = {"added": [], "changed": [], "deleted": []}
@@ -1409,6 +1422,10 @@ class EASClient:
                 "Recurrence_MonthOfYear": "recurrence_monthofyear",
                 "Recurrence_Until": "recurrence_until",
                 "Recurrence_Occurrences": "recurrence_occurrences",
+                "DisallowNewTimeProposal": "disallow_new_time_proposal",
+                "ResponseRequested": "response_requested",
+                "AppointmentReplyTime": "appointment_reply_time",
+                "ResponseType": "response_type",
             }
             if tag == "Attendee_Name":
                 cur.setdefault("attendees", []).append({"name": value})
