@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from eas_client import EASClient, FOLDER_TYPES
 from minio_storage import MinioStorage, MinioStorageConfig
+from ews_client import EWSClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,6 +49,10 @@ MINIO_CONFIG = MinioStorageConfig(
     use_ssl=MINIO_USE_SSL,
 )
 MINIO_STORAGE = MinioStorage(MINIO_CONFIG)
+
+EWS_URL = os.environ.get("EWS_URL", f"https://{EAS_HOST}/EWS/Exchange.asmx")
+EWS_ENABLED = os.environ.get("EWS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+_global_ews = None
 
 
 # ============================================================
@@ -119,6 +124,21 @@ def get_client(ctx=None) -> EASClient:
     return _global_eas
 
 
+def get_ews_client() -> Optional[EWSClient]:
+    global _global_ews
+    if not EWS_ENABLED:
+        return None
+    if not EAS_USERNAME or not EAS_PASSWORD:
+        return None
+    if _global_ews is None:
+        _global_ews = EWSClient(
+            url=EWS_URL,
+            username=EAS_USERNAME,
+            password=EAS_PASSWORD,
+        )
+    return _global_ews
+
+
 def _sanitize_storage_part(raw_value: str, fallback: str) -> str:
     normalized_value = (raw_value or "").strip()
     if not normalized_value:
@@ -151,6 +171,32 @@ def _enrich_calendar_event_attachments(client: EASClient, event_payload: dict) -
 
     raw_attachments = event_payload.get("attachments")
     if not isinstance(raw_attachments, list) or not raw_attachments:
+        event_payload["attachments"] = []
+        raw_attachments = event_payload["attachments"]
+
+    contains_eas_file_reference = any(
+        str(attachment_payload.get("file_reference") or "").strip()
+        for attachment_payload in raw_attachments
+    )
+    if not contains_eas_file_reference:
+        ews_client = get_ews_client()
+        if ews_client is not None:
+            try:
+                ews_attachments = ews_client.get_calendar_attachment_metadata(
+                    uid=str(event_payload.get("uid") or ""),
+                    subject=str(event_payload.get("subject") or ""),
+                    start_time=str(event_payload.get("start") or ""),
+                )
+                if ews_attachments:
+                    event_payload["attachments"] = ews_attachments
+                    event_payload["attachments_source"] = "ews_fallback"
+            except Exception as ews_error:
+                logger.warning(
+                    "EWS attachment fallback failed for uid=%s subject=%s error=%s",
+                    event_payload.get("uid", ""),
+                    event_payload.get("subject", ""),
+                    ews_error,
+                )
         return event_payload
 
     for attachment_payload in raw_attachments:
@@ -1129,6 +1175,32 @@ async def api_debug_calendar_item(
             }
             for depth, tag, value in raw_elements[:500]
         ],
+    }
+
+
+@api.get("/api/debug/calendar_item_ews", tags=["Debug"], summary="Debug EWS calendar attachment metadata")
+async def api_debug_calendar_item_ews(
+    uid: str = Query("", description="Calendar UID"),
+    subject: str = Query("", description="Calendar subject"),
+    start: str = Query("", description="Calendar start time (EAS compact or ISO UTC)"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    _verify_key(x_api_key, authorization)
+    ews_client = get_ews_client()
+    if ews_client is None:
+        return {"error": "EWS fallback is disabled"}
+    attachments = ews_client.get_calendar_attachment_metadata(
+        uid=uid,
+        subject=subject,
+        start_time=start,
+    )
+    return {
+        "uid": uid,
+        "subject": subject,
+        "start": start,
+        "attachments_count": len(attachments),
+        "attachments": attachments,
     }
 
 
