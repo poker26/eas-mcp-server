@@ -6,6 +6,9 @@ Provides tools for reading email, calendar, and contacts via EAS protocol.
 import json
 import os
 import logging
+import base64
+import hashlib
+import re
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -114,6 +117,103 @@ def get_client(ctx=None) -> EASClient:
         )
         _global_eas.folder_sync()
     return _global_eas
+
+
+def _sanitize_storage_part(raw_value: str, fallback: str) -> str:
+    normalized_value = (raw_value or "").strip()
+    if not normalized_value:
+        return fallback
+    sanitized_value = re.sub(r"[^a-zA-Z0-9._@-]+", "_", normalized_value)
+    return sanitized_value[:160] or fallback
+
+
+def _build_attachment_object_key(event_payload: dict, attachment_payload: dict) -> str:
+    event_identifier = _sanitize_storage_part(
+        str(event_payload.get("uid") or event_payload.get("server_id") or "event"),
+        "event",
+    )
+    source_file_reference = str(attachment_payload.get("file_reference") or "")
+    reference_hash = hashlib.sha1(source_file_reference.encode("utf-8")).hexdigest()[:16]
+    attachment_name = _sanitize_storage_part(
+        str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or "attachment.bin"
+        ),
+        "attachment.bin",
+    )
+    return f"exchange/calendar/{event_identifier}/{reference_hash}-{attachment_name}"
+
+
+def _enrich_calendar_event_attachments(client: EASClient, event_payload: dict) -> dict:
+    if not MINIO_STORAGE.is_enabled():
+        return event_payload
+
+    raw_attachments = event_payload.get("attachments")
+    if not isinstance(raw_attachments, list) or not raw_attachments:
+        return event_payload
+
+    for attachment_payload in raw_attachments:
+        file_reference = str(attachment_payload.get("file_reference") or "").strip()
+        if not file_reference:
+            continue
+
+        object_key = _build_attachment_object_key(event_payload, attachment_payload)
+        attachment_payload["storage_bucket"] = MINIO_BUCKET_MEDIA
+        attachment_payload["storage_object_key"] = object_key
+
+        try:
+            if MINIO_STORAGE.object_exists(object_key):
+                attachment_payload["storage_status"] = "cached"
+                attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+                continue
+
+            attachment_response = client.get_attachment(file_reference)
+            if attachment_response.get("status") != "ok":
+                attachment_payload["storage_status"] = "download_error"
+                attachment_payload["storage_error"] = attachment_response.get("status", "unknown")
+                continue
+
+            raw_data = attachment_response.get("data")
+            if not raw_data:
+                attachment_payload["storage_status"] = "empty_payload"
+                continue
+
+            attachment_bytes = base64.b64decode(raw_data)
+            content_type = str(
+                attachment_payload.get("content_type")
+                or attachment_response.get("content_type")
+                or "application/octet-stream"
+            )
+            MINIO_STORAGE.upload_bytes(
+                object_key=object_key,
+                payload=attachment_bytes,
+                content_type=content_type,
+            )
+
+            attachment_payload["storage_status"] = "uploaded"
+            attachment_payload["content_type"] = content_type
+            attachment_payload["size_bytes"] = len(attachment_bytes)
+            attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+        except Exception as storage_error:
+            attachment_payload["storage_status"] = "storage_error"
+            attachment_payload["storage_error"] = str(storage_error)
+            logger.warning(
+                "Attachment MinIO enrichment failed for event=%s file_reference=%s error=%s",
+                event_payload.get("server_id", ""),
+                file_reference,
+                storage_error,
+            )
+
+    return event_payload
+
+
+def _enrich_calendar_attachments_batch(client: EASClient, events: list) -> list:
+    if not MINIO_STORAGE.is_enabled():
+        return events
+    for event_payload in events:
+        _enrich_calendar_event_attachments(client, event_payload)
+    return events
 
 
 # ============================================================
@@ -376,6 +476,8 @@ async def exchange_get_calendar(
         events = client.expand_recurring(events, df, dt)
     else:
         events.sort(key=lambda e: e.get("start", ""))
+
+    events = _enrich_calendar_attachments_batch(client, events)
 
     return json.dumps({
         "events": events,
@@ -697,6 +799,7 @@ async def api_calendar(
         events = c.expand_recurring(events, df_s, dt_s)
 
     events.sort(key=lambda e: e.get("start", ""))
+    events = _enrich_calendar_attachments_batch(c, events)
     return {"events": events, "count": len(events), "date_from": df, "date_to": dt}
 
 
@@ -788,6 +891,8 @@ async def api_new_events(
     fid = folder_id or c.find_folder(8)
     result = c.sync_incremental(fid, window_size=max, body_type="1", body_size="4096")
     delta = c.parse_calendar_delta(result.get("elements", []))
+    delta["added"] = _enrich_calendar_attachments_batch(c, delta["added"])
+    delta["changed"] = _enrich_calendar_attachments_batch(c, delta["changed"])
     events = delta["added"] + delta["changed"]
     return {
         "events": events,  # backward compatibility
@@ -955,6 +1060,8 @@ async def exchange_get_new_events(
     )
 
     delta = client.parse_calendar_delta(result.get("elements", []))
+    delta["added"] = _enrich_calendar_attachments_batch(client, delta["added"])
+    delta["changed"] = _enrich_calendar_attachments_batch(client, delta["changed"])
     events = delta["added"] + delta["changed"]
 
     return json.dumps({

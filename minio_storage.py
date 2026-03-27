@@ -76,6 +76,21 @@ class MinioStorage:
             content_type=content_type,
         )
 
+    def object_exists(self, object_key: str) -> bool:
+        if not self.is_enabled():
+            return False
+        client = self._get_client()
+        try:
+            client.stat_object(
+                bucket_name=self.config.bucket_media,
+                object_name=object_key,
+            )
+            return True
+        except S3Error as error:
+            if error.code in ("NoSuchKey", "NoSuchObject", "NotFound"):
+                return False
+            raise
+
     def presigned_get_url(
         self,
         object_key: str,

@@ -82,6 +82,11 @@ Use the MCP Client node with HTTP transport pointing to
 | `EAS_PASSWORD` | Password | required |
 | `EAS_DEVICE_ID` | Device ID for EAS whitelist | `EAS0LEGCLIENT0001` |
 | `EAS_PROTOCOL` | EAS protocol version | `14.1` |
+| `MINIO_ENDPOINT` | MinIO/S3 endpoint for calendar attachments | empty (disabled) |
+| `MINIO_ACCESS_KEY` | MinIO access key | empty (disabled) |
+| `MINIO_SECRET_KEY` | MinIO secret key | empty (disabled) |
+| `MINIO_BUCKET_MEDIA` | Bucket for uploaded calendar attachments | empty (disabled) |
+| `MINIO_USE_SSL` | Use HTTPS for MinIO connection | `true` |
 
 ## Security Notes
 

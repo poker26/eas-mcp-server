@@ -140,6 +140,10 @@ Fetch calendar events.
 - `location` — location
 - `organizer_name` / `organizer_email` — organizer
 - `attendees` — list of participants
+- `attachments` — list of event attachments (if Exchange provides them)
+  - `file_reference` — EAS reference used to fetch binary
+  - `display_name` / `name` — attachment name
+  - `presigned_url` — temporary MinIO download URL (when MinIO is enabled)
 - `all_day` — 0 or 1
 - `busy_status` — 0=Free, 1=Tentative, 2=Busy, 3=OOF
 - `reminder` — minutes before event

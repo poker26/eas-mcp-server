@@ -603,9 +603,16 @@ class EASClient:
     def parse_calendar(self, elements: list) -> list:
         events = []
         cur = {}
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and any(pending_attachment.values()):
+                item.setdefault("attachments", []).append(pending_attachment)
+
         for _, tag, value in elements:
             if tag == "ServerId" and value:
                 if cur.get("subject") or cur.get("start"):
+                    flush_pending_attachment(cur)
                     events.append(cur)
                 cur = {"server_id": value}
                 continue
@@ -634,9 +641,33 @@ class EASClient:
                 att = cur.get("attendees", [])
                 if att:
                     att[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    cur.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                cur["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "EstimatedDataSize": "estimated_size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                cur["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 cur[mapping[tag]] = value
         if cur.get("subject") or cur.get("start"):
+            flush_pending_attachment(cur)
             events.append(cur)
         return events
 
@@ -675,6 +706,10 @@ class EASClient:
                 current_item = None
                 current_operation = None
                 return
+
+            pending_attachment = current_item.pop("_pending_attachment", None)
+            if pending_attachment and any(pending_attachment.values()):
+                current_item.setdefault("attachments", []).append(pending_attachment)
 
             if current_operation == "delete":
                 if current_item.get("server_id"):
@@ -717,6 +752,29 @@ class EASClient:
                 attendee_list = current_item.get("attendees", [])
                 if attendee_list:
                     attendee_list[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = current_item.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    current_item.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                current_item["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "EstimatedDataSize": "estimated_size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = current_item.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                current_item["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 current_item[mapping[tag]] = value
 
@@ -1285,9 +1343,16 @@ class EASClient:
         """
         events = []
         cur = None
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and any(pending_attachment.values()):
+                item.setdefault("attachments", []).append(pending_attachment)
+
         for _, tag, value in elements:
             if tag == "Result" and value is None:
                 if cur is not None and (cur.get("subject") or cur.get("start")):
+                    flush_pending_attachment(cur)
                     events.append(cur)
                 cur = {}
                 continue
@@ -1321,8 +1386,32 @@ class EASClient:
                 att = cur.get("attendees", [])
                 if att:
                     att[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    cur.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                cur["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "EstimatedDataSize": "estimated_size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                cur["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 cur[mapping[tag]] = value
         if cur is not None and (cur.get("subject") or cur.get("start")):
+            flush_pending_attachment(cur)
             events.append(cur)
         return events
