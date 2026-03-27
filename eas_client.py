@@ -606,7 +606,11 @@ class EASClient:
 
         def flush_pending_attachment(item: dict) -> None:
             pending_attachment = item.pop("_pending_attachment", None)
-            if pending_attachment and any(pending_attachment.values()):
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
                 item.setdefault("attachments", []).append(pending_attachment)
 
         for _, tag, value in elements:
@@ -650,11 +654,11 @@ class EASClient:
                     pending_attachment = {}
                 pending_attachment["file_reference"] = value
                 cur["_pending_attachment"] = pending_attachment
-            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
                 attachment_field_mapping = {
                     "DisplayName": "display_name",
                     "AttName": "name",
-                    "EstimatedDataSize": "estimated_size",
+                    "AttSize": "size",
                     "ContentType": "content_type",
                     "Method": "method",
                     "IsInline": "is_inline",
@@ -708,7 +712,11 @@ class EASClient:
                 return
 
             pending_attachment = current_item.pop("_pending_attachment", None)
-            if pending_attachment and any(pending_attachment.values()):
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
                 current_item.setdefault("attachments", []).append(pending_attachment)
 
             if current_operation == "delete":
@@ -761,11 +769,11 @@ class EASClient:
                     pending_attachment = {}
                 pending_attachment["file_reference"] = value
                 current_item["_pending_attachment"] = pending_attachment
-            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
                 attachment_field_mapping = {
                     "DisplayName": "display_name",
                     "AttName": "name",
-                    "EstimatedDataSize": "estimated_size",
+                    "AttSize": "size",
                     "ContentType": "content_type",
                     "Method": "method",
                     "IsInline": "is_inline",
@@ -1346,7 +1354,11 @@ class EASClient:
 
         def flush_pending_attachment(item: dict) -> None:
             pending_attachment = item.pop("_pending_attachment", None)
-            if pending_attachment and any(pending_attachment.values()):
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
                 item.setdefault("attachments", []).append(pending_attachment)
 
         for _, tag, value in elements:
@@ -1395,11 +1407,11 @@ class EASClient:
                     pending_attachment = {}
                 pending_attachment["file_reference"] = value
                 cur["_pending_attachment"] = pending_attachment
-            elif tag in ("DisplayName", "AttName", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
                 attachment_field_mapping = {
                     "DisplayName": "display_name",
                     "AttName": "name",
-                    "EstimatedDataSize": "estimated_size",
+                    "AttSize": "size",
                     "ContentType": "content_type",
                     "Method": "method",
                     "IsInline": "is_inline",
