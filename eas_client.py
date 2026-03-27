@@ -680,6 +680,10 @@ class EASClient:
                 cur["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 cur[mapping[tag]] = value
+            else:
+                if tag not in {"ApplicationData", "Add", "Change", "Delete", "Commands"}:
+                    cur.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    cur["exchange_raw_fields"][tag].append(value)
         if cur.get("subject") or cur.get("start"):
             flush_pending_attachment(cur)
             events.append(cur)
@@ -795,6 +799,10 @@ class EASClient:
                 current_item["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 current_item[mapping[tag]] = value
+            else:
+                if tag not in {"ApplicationData", "Add", "Change", "Delete", "Commands"}:
+                    current_item.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    current_item["exchange_raw_fields"][tag].append(value)
 
         flush_current_item()
         return delta
@@ -1433,6 +1441,10 @@ class EASClient:
                 cur["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 cur[mapping[tag]] = value
+            else:
+                if tag not in {"Result", "Properties", "Response", "Store"}:
+                    cur.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    cur["exchange_raw_fields"][tag].append(value)
         if cur is not None and (cur.get("subject") or cur.get("start")):
             flush_pending_attachment(cur)
             events.append(cur)
