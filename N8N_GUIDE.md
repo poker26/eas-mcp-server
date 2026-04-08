@@ -86,6 +86,13 @@ Fetch emails from a mailbox folder.
 - `importance` — low / normal / high
 - `body` — full text (only if `include_body` = true)
 - `preview` — short preview text
+- `message_class` — Exchange message class (for invites typically `IPM.Schedule.Meeting.*`)
+- `attachments` — list of email attachments (when present)
+  - `file_reference` — EAS reference for attachment download
+  - `display_name` / `name` — attachment filename
+  - `storage_status`, `storage_object_key`, `presigned_url` — MinIO upload metadata
+
+Meeting invites are not filtered out: they appear in the same email stream with `message_class`.
 
 ---
 
@@ -140,6 +147,10 @@ Fetch calendar events.
 - `location` — location
 - `organizer_name` / `organizer_email` — organizer
 - `attendees` — list of participants
+- `attachments` — list of event attachments (if Exchange provides them)
+  - `file_reference` — EAS reference used to fetch binary
+  - `display_name` / `name` — attachment name
+  - `presigned_url` — temporary MinIO download URL (when MinIO is enabled)
 - `all_day` — 0 or 1
 - `busy_status` — 0=Free, 1=Tentative, 2=Busy, 3=OOF
 - `reminder` — minutes before event

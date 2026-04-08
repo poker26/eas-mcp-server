@@ -30,6 +30,7 @@ CP_AIRSYNC = {
     0x17: "Options", 0x18: "FilterType", 0x1B: "Conflict",
     0x1C: "Collections", 0x1D: "ApplicationData",
     0x1E: "DeletesAsMoves", 0x22: "MIMESupport",
+    0x23: "MIMETruncation",
 }
 
 CP_CONTACTS = {
@@ -88,6 +89,11 @@ CP_CALENDAR = {
     0x24: "Reminder", 0x25: "Sensitivity", 0x26: "Subject",
     0x27: "StartTime", 0x28: "UID",
     0x29: "Attendee_Status", 0x2A: "Attendee_Type",
+    # Extended calendar fields (EAS 14+)
+    0x33: "DisallowNewTimeProposal",
+    0x34: "ResponseRequested",
+    0x35: "AppointmentReplyTime",
+    0x36: "ResponseType",
 }
 
 CP_FOLDER = {
@@ -107,7 +113,38 @@ CP_AIRSYNCBASE = {
     0x19: "Preview",
 }
 
-# Page 14: ItemOperations
+# Page 15: Search ([MS-ASWBXML] section 2.1.2.1.16)
+CP_SEARCH = {
+    0x05: "Search",
+    0x07: "Store",
+    0x08: "Name",
+    0x09: "Query",
+    0x0A: "Options",
+    0x0B: "Range",
+    0x0C: "Status",
+    0x0D: "Response",
+    0x0E: "Result",
+    0x0F: "Properties",
+    0x10: "Total",
+    0x11: "EqualTo",
+    0x12: "Value",
+    0x13: "And",
+    0x14: "Or",
+    0x15: "FreeText",
+    0x17: "DeepTraversal",
+    0x18: "LongId",
+    0x19: "RebuildResults",
+    0x1A: "LessThan",
+    0x1B: "GreaterThan",
+    0x1E: "UserName",
+    0x1F: "Password",
+    0x20: "ConversationId",
+    0x21: "Picture",
+    0x22: "MaxSize",
+    0x23: "MaxPictures",
+}
+
+# Page 20: ItemOperations
 CP_ITEMOPS = {
     0x05: "ItemOperations", 0x06: "Fetch", 0x07: "Store",
     0x08: "Options", 0x09: "Range", 0x0A: "Total",
@@ -119,7 +156,10 @@ CP_ITEMOPS = {
 
 ALL_PAGES = {
     0: CP_AIRSYNC, 1: CP_CONTACTS, 2: CP_EMAIL,
-    4: CP_CALENDAR, 7: CP_FOLDER, 14: CP_ITEMOPS, 17: CP_AIRSYNCBASE,
+    4: CP_CALENDAR, 7: CP_FOLDER,
+    13: CP_SEARCH,  # defensive alias (expected: Ping)
+    14: CP_ITEMOPS,  # defensive alias (expected: Provision)
+    15: CP_SEARCH, 17: CP_AIRSYNCBASE, 20: CP_ITEMOPS,
 }
 
 FOLDER_TYPES = {
@@ -317,7 +357,8 @@ class EASClient:
 
     # --- Incremental sync ---
     def sync_incremental(self, collection_id: str, window_size: int = 50,
-                         body_type: str = "1", body_size: str = "51200") -> dict:
+                         body_type: str = "1", body_size: str = "51200",
+                         include_attachments: bool = False) -> dict:
         """Sync only new/changed items since last sync.
 
         Uses stored SyncKey. On first call, drains all existing items
@@ -340,7 +381,8 @@ class EASClient:
             total_drained = 0
             while True:
                 r = self.sync(collection_id, key, window_size=500,
-                             body_type="1", body_size="0")
+                             body_type="1", body_size="0",
+                             include_attachments=include_attachments)
                 new_key = r.get("sync_key")
                 status = r.get("status")
 
@@ -373,7 +415,8 @@ class EASClient:
 
         # Incremental: use stored key — only new items
         r = self.sync(collection_id, stored_key, window_size=window_size,
-                     body_type=body_type, body_size=body_size)
+                     body_type=body_type, body_size=body_size,
+                     include_attachments=include_attachments)
 
         new_key = r.get("sync_key")
         status = r.get("status")
@@ -444,7 +487,8 @@ class EASClient:
     # --- Sync ---
     def sync(self, collection_id: str, sync_key: str = "0",
              window_size: int = 50, body_type: str = "1",
-             body_size: str = "51200", filter_type: str = "") -> dict:
+             body_size: str = "51200", filter_type: str = "",
+             include_attachments: bool = False) -> dict:
         enc = WBXMLEncoder()
         enc.tag_open(0, 0x05)   # Sync
         enc.tag_open(0, 0x1C)   # Collections
@@ -462,6 +506,11 @@ class EASClient:
             enc.tag_str(17, 0x06, body_type)
             enc.tag_str(17, 0x07, body_size)
             enc.end()  # BodyPreference
+            if include_attachments:
+                # Request full MIME metadata so Exchange may include attachment
+                # descriptors (including FileReference) in Sync payload.
+                enc.tag_str(0, 0x22, "2")  # MIMESupport = BestBody
+                enc.tag_str(0, 0x23, "0")  # MIMETruncation = No truncation
             enc.end()  # Options
 
         enc.end()  # Collection
@@ -483,6 +532,154 @@ class EASClient:
             self.sync_keys[collection_id] = new_key
 
         return {"status": status, "sync_key": new_key, "elements": elements}
+
+    def sync_fetch_item(
+        self,
+        collection_id: str,
+        server_id: str,
+        body_type: str = "1",
+        body_size: str = "51200",
+        include_attachments: bool = True,
+    ) -> dict:
+        """Fetch a single item from a collection using Sync/Fetch command."""
+        if not server_id:
+            return {"status": "error", "message": "server_id is required", "elements": []}
+
+        collection_key = str(collection_id)
+        active_sync_key = (
+            self.incr_keys.get(collection_key)
+            or self.sync_keys.get(collection_key)
+        )
+        if not active_sync_key:
+            baseline_response = self.sync(collection_id, "0")
+            active_sync_key = baseline_response.get("sync_key")
+            if not active_sync_key:
+                return {"status": "error", "message": "Failed to initialize SyncKey", "elements": []}
+
+        enc = WBXMLEncoder()
+        enc.tag_open(0, 0x05)  # Sync
+        enc.tag_open(0, 0x1C)  # Collections
+        enc.tag_open(0, 0x0F)  # Collection
+        enc.tag_str(0, 0x0B, active_sync_key)  # SyncKey
+        enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
+
+        enc.tag_open(0, 0x17)  # Options
+        enc.tag_open(17, 0x05)  # BodyPreference
+        enc.tag_str(17, 0x06, body_type)
+        enc.tag_str(17, 0x07, body_size)
+        enc.end()  # BodyPreference
+        if include_attachments:
+            enc.tag_str(0, 0x22, "2")  # MIMESupport
+            enc.tag_str(0, 0x23, "0")  # MIMETruncation
+        enc.end()  # Options
+
+        enc.tag_open(0, 0x16)  # Commands
+        enc.tag_open(0, 0x0A)  # Fetch
+        enc.tag_str(0, 0x0D, str(server_id))  # ServerId
+        enc.end()  # Fetch
+        enc.end()  # Commands
+
+        enc.end()  # Collection
+        enc.end()  # Collections
+        enc.end()  # Sync
+
+        response = self._post("Sync", enc.get())
+        if response.status_code != 200:
+            return {"status": f"HTTP {response.status_code}", "elements": []}
+        if not response.content:
+            return {"status": "empty", "sync_key": active_sync_key, "elements": []}
+
+        elements = self._decode(response)
+        status = self._find(elements, "Status")
+        updated_sync_key = self._find(elements, "SyncKey") or active_sync_key
+        self.sync_keys[collection_key] = updated_sync_key
+        self.incr_keys[collection_key] = updated_sync_key
+        self._save_state()
+
+        return {
+            "status": status,
+            "sync_key": updated_sync_key,
+            "elements": elements,
+            "requested_server_id": str(server_id),
+        }
+
+    def item_operations_fetch_calendar_item(
+        self,
+        collection_id: str,
+        server_id: str,
+        body_type: str = "1",
+        body_size: str = "4096",
+        include_schema: bool = True,
+    ) -> dict:
+        """Fetch a single calendar item via ItemOperations/Fetch."""
+        if not collection_id:
+            return {"status": "error", "message": "collection_id is required", "elements": []}
+        if not server_id:
+            return {"status": "error", "message": "server_id is required", "elements": []}
+
+        enc = WBXMLEncoder()
+        enc.tag_open(20, 0x05)   # ItemOperations
+        enc.tag_open(20, 0x06)   # Fetch
+        enc.tag_str(20, 0x07, "Mailbox")  # Store
+        enc.tag_str(0, 0x12, str(collection_id))  # CollectionId
+        enc.tag_str(0, 0x0D, str(server_id))  # ServerId
+        enc.tag_open(20, 0x08)   # Options
+        if include_schema:
+            # Explicitly request calendar and AirSyncBase fields so the server
+            # can return attachment metadata when it is available for the item.
+            enc.tag_open(20, 0x10)  # Schema
+            enc.tag_empty(4, 0x26)   # Calendar:Subject
+            enc.tag_empty(4, 0x27)   # Calendar:StartTime
+            enc.tag_empty(4, 0x12)   # Calendar:EndTime
+            enc.tag_empty(4, 0x17)   # Calendar:Location
+            enc.tag_empty(4, 0x28)   # Calendar:UID
+            enc.tag_empty(4, 0x1A)   # Calendar:Organizer_Name
+            enc.tag_empty(4, 0x19)   # Calendar:Organizer_Email
+            enc.tag_empty(4, 0x18)   # Calendar:MeetingStatus
+            enc.tag_empty(4, 0x07)   # Calendar:Attendees
+            enc.tag_empty(17, 0x0A)  # AirSyncBase:Body
+            enc.tag_empty(17, 0x0E)  # AirSyncBase:Attachments
+            enc.tag_empty(17, 0x0F)  # AirSyncBase:Attachment
+            enc.tag_empty(17, 0x10)  # AirSyncBase:DisplayName
+            enc.tag_empty(17, 0x11)  # AirSyncBase:FileReference
+            enc.tag_empty(17, 0x17)  # AirSyncBase:ContentType
+            enc.tag_empty(17, 0x16)  # AirSyncBase:NativeBodyType
+            enc.end()  # Schema
+        enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
+        enc.tag_str(17, 0x06, body_type)
+        enc.tag_str(17, 0x07, body_size)
+        enc.end()  # BodyPreference
+        enc.end()  # Options
+        enc.end()  # Fetch
+        enc.end()  # ItemOperations
+
+        response = self._post("ItemOperations", enc.get())
+        if response.status_code != 200:
+            return {"status": f"HTTP {response.status_code}", "elements": []}
+        if not response.content:
+            return {"status": "empty", "elements": []}
+
+        elements = self._decode(response)
+        top_level_status = self._find(elements, "Status")
+        fetch_status = None
+        inside_fetch = False
+        for _, tag, value in elements:
+            if tag == "Fetch" and value is None:
+                inside_fetch = True
+                continue
+            if inside_fetch and tag == "Status" and value is not None:
+                fetch_status = value
+                break
+
+        status = fetch_status or top_level_status
+        return {
+            "status": status,
+            "top_level_status": top_level_status,
+            "fetch_status": fetch_status,
+            "elements": elements,
+            "requested_server_id": str(server_id),
+            "collection_id": str(collection_id),
+        }
 
     def sync_folder(self, collection_id: str, **kwargs) -> dict:
         """Full sync: fetches ALL items by looping until Exchange has no more."""
@@ -518,6 +715,13 @@ class EASClient:
         logger.info("sync_folder complete: %d total elements",
                     sum(1 for _, tag, val in all_elements if tag == "ServerId" and val))
 
+        # Keep incr_keys in sync so that sync_incremental (get_new_events) can
+        # continue from the current position instead of hitting an invalid key.
+        # sync(fid, "0") resets the server-side sync state, which invalidates
+        # any previously stored incr_keys entry for this folder.
+        self.incr_keys[str(collection_id)] = key
+        self._save_state()
+
         return {
             "status": "1",
             "sync_key": key,
@@ -536,9 +740,20 @@ class EASClient:
     def parse_emails(self, elements: list) -> list:
         emails = []
         cur = {}
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
+                item.setdefault("attachments", []).append(pending_attachment)
+
         for _, tag, value in elements:
             if tag == "ServerId" and value:
                 if cur.get("subject") or cur.get("from"):
+                    flush_pending_attachment(cur)
                     emails.append(cur)
                 cur = {"server_id": value}
                 continue
@@ -547,25 +762,61 @@ class EASClient:
                     "Subject": "subject", "From": "from", "To": "to",
                     "Cc": "cc", "DateReceived": "date",
                     "DisplayTo": "display_to", "Importance": "importance",
-                    "Read": "read", "MessageClass": "class",
+                    "Read": "read",
                     "Data": "body", "Preview": "preview",
-                    "EstimatedDataSize": "size", "ThreadTopic": "thread_topic",
-                    "FileReference": "file_reference",
-                    "DisplayName": "att_display_name",
-                    "AttName": "att_name",
+                    "ThreadTopic": "thread_topic",
                 }
-                if tag in mapping:
+                if tag == "MessageClass":
+                    cur["message_class"] = value
+                    cur["class"] = value  # backward compatibility
+                elif tag == "FileReference":
+                    pending_attachment = cur.get("_pending_attachment")
+                    if pending_attachment and pending_attachment.get("file_reference"):
+                        cur.setdefault("attachments", []).append(pending_attachment)
+                        pending_attachment = {}
+                    if pending_attachment is None:
+                        pending_attachment = {}
+                    pending_attachment["file_reference"] = value
+                    cur["_pending_attachment"] = pending_attachment
+                elif tag in ("DisplayName", "AttName", "AttSize", "EstimatedDataSize", "ContentType", "Method", "IsInline"):
+                    attachment_field_mapping = {
+                        "DisplayName": "display_name",
+                        "AttName": "name",
+                        "AttSize": "size",
+                        "EstimatedDataSize": "estimated_size",
+                        "ContentType": "content_type",
+                        "Method": "method",
+                        "IsInline": "is_inline",
+                    }
+                    pending_attachment = cur.get("_pending_attachment")
+                    if pending_attachment is None:
+                        pending_attachment = {}
+                    pending_attachment[attachment_field_mapping[tag]] = value
+                    cur["_pending_attachment"] = pending_attachment
+                elif tag in mapping:
                     cur[mapping[tag]] = value
         if cur.get("subject") or cur.get("from"):
+            flush_pending_attachment(cur)
             emails.append(cur)
         return emails
 
     def parse_calendar(self, elements: list) -> list:
         events = []
         cur = {}
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
+                item.setdefault("attachments", []).append(pending_attachment)
+
         for _, tag, value in elements:
             if tag == "ServerId" and value:
                 if cur.get("subject") or cur.get("start"):
+                    flush_pending_attachment(cur)
                     events.append(cur)
                 cur = {"server_id": value}
                 continue
@@ -587,6 +838,10 @@ class EASClient:
                 "Recurrence_MonthOfYear": "recurrence_monthofyear",
                 "Recurrence_Until": "recurrence_until",
                 "Recurrence_Occurrences": "recurrence_occurrences",
+                "DisallowNewTimeProposal": "disallow_new_time_proposal",
+                "ResponseRequested": "response_requested",
+                "AppointmentReplyTime": "appointment_reply_time",
+                "ResponseType": "response_type",
             }
             if tag == "Attendee_Name":
                 cur.setdefault("attendees", []).append({"name": value})
@@ -594,11 +849,161 @@ class EASClient:
                 att = cur.get("attendees", [])
                 if att:
                     att[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    cur.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                cur["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "AttSize": "size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                cur["_pending_attachment"] = pending_attachment
             elif tag in mapping:
                 cur[mapping[tag]] = value
+            else:
+                if tag not in {"ApplicationData", "Add", "Change", "Delete", "Commands"}:
+                    cur.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    cur["exchange_raw_fields"][tag].append(value)
         if cur.get("subject") or cur.get("start"):
+            flush_pending_attachment(cur)
             events.append(cur)
         return events
+
+    def parse_calendar_delta(self, elements: list) -> dict:
+        """Parse incremental Sync calendar response into added/changed/deleted buckets.
+
+        This parser keeps SyncKey logic untouched and only interprets response payload:
+        - Add/Change blocks become calendar items
+        - Delete blocks become tombstones with server_id (and uid if present)
+        """
+        mapping = {
+            "Subject": "subject", "StartTime": "start",
+            "EndTime": "end", "Location": "location",
+            "Organizer_Name": "organizer_name",
+            "Organizer_Email": "organizer_email",
+            "AllDayEvent": "all_day", "BusyStatus": "busy_status",
+            "Reminder": "reminder", "UID": "uid", "DtStamp": "stamp",
+            "MeetingStatus": "meeting_status",
+            "Recurrence_Type": "recurrence_type",
+            "Recurrence_Interval": "recurrence_interval",
+            "Recurrence_DayOfWeek": "recurrence_dayofweek",
+            "Recurrence_DayOfMonth": "recurrence_dayofmonth",
+            "Recurrence_WeekOfMonth": "recurrence_weekofmonth",
+            "Recurrence_MonthOfYear": "recurrence_monthofyear",
+            "Recurrence_Until": "recurrence_until",
+            "Recurrence_Occurrences": "recurrence_occurrences",
+            "DisallowNewTimeProposal": "disallow_new_time_proposal",
+            "ResponseRequested": "response_requested",
+            "AppointmentReplyTime": "appointment_reply_time",
+            "ResponseType": "response_type",
+        }
+
+        delta = {"added": [], "changed": [], "deleted": []}
+        current_operation = None
+        current_item = None
+
+        def flush_current_item():
+            nonlocal current_item, current_operation
+            if not current_item or not current_operation:
+                current_item = None
+                current_operation = None
+                return
+
+            pending_attachment = current_item.pop("_pending_attachment", None)
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
+                current_item.setdefault("attachments", []).append(pending_attachment)
+
+            if current_operation == "delete":
+                if current_item.get("server_id"):
+                    delta["deleted"].append({
+                        "server_id": current_item.get("server_id"),
+                        "uid": current_item.get("uid", ""),
+                    })
+            elif current_operation == "add":
+                if current_item.get("server_id") or current_item.get("subject") or current_item.get("start"):
+                    delta["added"].append(current_item)
+            elif current_operation == "change":
+                if current_item.get("server_id") or current_item.get("subject") or current_item.get("start"):
+                    delta["changed"].append(current_item)
+
+            current_item = None
+            current_operation = None
+
+        for _, tag, value in elements:
+            if tag in ("Add", "Change", "Delete") and value is None:
+                flush_current_item()
+                current_operation = tag.lower()
+                current_item = {}
+                continue
+
+            if current_operation is None:
+                continue
+
+            if tag == "ServerId" and value:
+                if current_item is None:
+                    current_item = {}
+                current_item["server_id"] = value
+                continue
+
+            if current_item is None or value is None:
+                continue
+
+            if tag == "Attendee_Name":
+                current_item.setdefault("attendees", []).append({"name": value})
+            elif tag == "Attendee_Email":
+                attendee_list = current_item.get("attendees", [])
+                if attendee_list:
+                    attendee_list[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = current_item.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    current_item.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                current_item["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "AttSize": "size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = current_item.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                current_item["_pending_attachment"] = pending_attachment
+            elif tag in mapping:
+                current_item[mapping[tag]] = value
+            else:
+                if tag not in {"ApplicationData", "Add", "Change", "Delete", "Commands"}:
+                    current_item.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    current_item["exchange_raw_fields"][tag].append(value)
+
+        flush_current_item()
+        return delta
 
     def expand_recurring(self, events: list, date_from: str, date_to: str) -> list:
         """Expand recurring events into individual instances for a date range.
@@ -825,12 +1230,12 @@ class EASClient:
         import base64 as b64module
 
         enc = WBXMLEncoder()
-        # <ItemOperations> page 14, tag 0x05
-        enc.tag_open(14, 0x05)
+        # <ItemOperations> page 20, tag 0x05
+        enc.tag_open(20, 0x05)
         # <Fetch> tag 0x06
-        enc.tag_open(14, 0x06)
+        enc.tag_open(20, 0x06)
         # <Store> tag 0x07
-        enc.tag_str(14, 0x07, "Mailbox")
+        enc.tag_str(20, 0x07, "Mailbox")
         # <FileReference> - AirSyncBase page 17, tag 0x11
         enc.tag_str(17, 0x11, file_reference)
         enc.end()  # Fetch
@@ -1056,10 +1461,193 @@ class EASClient:
                     server_id = val
 
             if status == "1":
+                final_sync_key = self._find(elements, "SyncKey") or sync_key2
+                if final_sync_key:
+                    calendar_id = str(cal_id)
+                    self.sync_keys[calendar_id] = final_sync_key
+                    self.incr_keys[calendar_id] = final_sync_key
+                    self._save_state()
                 return {"status": "created", "server_id": server_id, "client_id": client_id}
             else:
                 return {"status": f"error_{status}", "client_id": client_id}
         elif resp.status_code == 200:
+            calendar_id = str(cal_id)
+            self.sync_keys[calendar_id] = sync_key2
+            self.incr_keys[calendar_id] = sync_key2
+            self._save_state()
             return {"status": "created_empty_response", "client_id": client_id}
         else:
             return {"status": f"HTTP {resp.status_code}"}
+
+    # --- Search Calendar ---
+    def search_calendar(self, folder_id: str, date_from: str = "", date_to: str = "",
+                        max_items: int = 500, body_size: str = "4096") -> dict:
+        """Query calendar items by date range using the EAS Search command.
+
+        Unlike sync_folder, this command does NOT use or modify any SyncKey.
+        It is safe to call concurrently with sync_incremental (get_new_events).
+
+        Args:
+            folder_id: Calendar folder ServerId
+            date_from: YYYY-MM-DD lower bound for StartTime (inclusive), or ""
+            date_to:   YYYY-MM-DD upper bound for EndTime (inclusive), or ""
+            max_items: Maximum number of results (Range header)
+            body_size: Body truncation size in bytes
+        Returns:
+            dict with status, elements (raw decoded WBXML), total
+        """
+        def to_iso(date_str: str, end_of_day: bool = False) -> str:
+            d = date_str.replace("-", "")
+            time_part = "23:59:59.999Z" if end_of_day else "00:00:00.000Z"
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{time_part}"
+
+        enc = WBXMLEncoder()
+        enc.tag_open(15, 0x05)   # Search
+        enc.tag_open(15, 0x07)   # Store
+        enc.tag_str(15, 0x08, "Mailbox")  # Name
+
+        enc.tag_open(15, 0x09)   # Query
+        enc.tag_open(15, 0x13)   # And
+        enc.tag_str(0, 0x10, "Calendar")       # AirSync:Class
+        enc.tag_str(0, 0x12, str(folder_id))   # AirSync:CollectionId
+        if date_from:
+            enc.tag_open(15, 0x1B)             # GreaterThan
+            enc.tag_empty(4, 0x27)             # Calendar:StartTime (field reference)
+            enc.tag_str(15, 0x12, to_iso(date_from))  # Value
+            enc.end()
+        if date_to:
+            enc.tag_open(15, 0x1A)             # LessThan
+            enc.tag_empty(4, 0x12)             # Calendar:EndTime (field reference)
+            enc.tag_str(15, 0x12, to_iso(date_to, end_of_day=True))  # Value
+            enc.end()
+        enc.end()  # And
+        enc.end()  # Query
+
+        enc.tag_open(15, 0x0A)   # Options
+        enc.tag_str(15, 0x0B, f"0-{max_items - 1}")  # Range
+        enc.tag_open(17, 0x05)   # AirSyncBase:BodyPreference
+        enc.tag_str(17, 0x06, "1")         # Type = plain text
+        enc.tag_str(17, 0x07, body_size)   # TruncationSize
+        enc.end()  # BodyPreference
+        enc.end()  # Options
+
+        enc.end()  # Store
+        enc.end()  # Search
+
+        resp = self._post("Search", enc.get())
+
+        if resp.status_code != 200:
+            return {"status": f"HTTP {resp.status_code}", "elements": []}
+        if not resp.content:
+            return {"status": "empty", "elements": []}
+
+        elements = self._decode(resp)
+        status = self._find(elements, "Status")
+        total_str = self._find(elements, "Total")
+        total = int(total_str) if total_str and total_str.isdigit() else 0
+        if status is None:
+            sample_tags = []
+            for _, tag, val in elements[:60]:
+                if val is None:
+                    sample_tags.append(tag)
+                else:
+                    sample_tags.append(f"{tag}={val}")
+            logger.warning(
+                "search_calendar: unable to decode Search response (status=None). sample=%s",
+                sample_tags,
+            )
+        logger.info("search_calendar: status=%s total=%s", status, total)
+        return {"status": status, "elements": elements, "total": total}
+
+    def parse_search_calendar(self, elements: list) -> list:
+        """Parse calendar events from an EAS Search response.
+
+        Search results are grouped under Result tags (not ServerId like Sync).
+        LongId is used as the item identifier.
+        """
+        events = []
+        cur = None
+
+        def flush_pending_attachment(item: dict) -> None:
+            pending_attachment = item.pop("_pending_attachment", None)
+            if pending_attachment and (
+                pending_attachment.get("file_reference")
+                or pending_attachment.get("display_name")
+                or pending_attachment.get("name")
+            ):
+                item.setdefault("attachments", []).append(pending_attachment)
+
+        for _, tag, value in elements:
+            if tag == "Result" and value is None:
+                if cur is not None and (cur.get("subject") or cur.get("start")):
+                    flush_pending_attachment(cur)
+                    events.append(cur)
+                cur = {}
+                continue
+            if cur is None:
+                continue
+            if tag == "LongId" and value:
+                cur["server_id"] = value
+                continue
+            if value is None:
+                continue
+            mapping = {
+                "Subject": "subject", "StartTime": "start",
+                "EndTime": "end", "Location": "location",
+                "Organizer_Name": "organizer_name",
+                "Organizer_Email": "organizer_email",
+                "AllDayEvent": "all_day", "BusyStatus": "busy_status",
+                "Reminder": "reminder", "UID": "uid", "DtStamp": "stamp",
+                "MeetingStatus": "meeting_status",
+                "Recurrence_Type": "recurrence_type",
+                "Recurrence_Interval": "recurrence_interval",
+                "Recurrence_DayOfWeek": "recurrence_dayofweek",
+                "Recurrence_DayOfMonth": "recurrence_dayofmonth",
+                "Recurrence_WeekOfMonth": "recurrence_weekofmonth",
+                "Recurrence_MonthOfYear": "recurrence_monthofyear",
+                "Recurrence_Until": "recurrence_until",
+                "Recurrence_Occurrences": "recurrence_occurrences",
+                "DisallowNewTimeProposal": "disallow_new_time_proposal",
+                "ResponseRequested": "response_requested",
+                "AppointmentReplyTime": "appointment_reply_time",
+                "ResponseType": "response_type",
+            }
+            if tag == "Attendee_Name":
+                cur.setdefault("attendees", []).append({"name": value})
+            elif tag == "Attendee_Email":
+                att = cur.get("attendees", [])
+                if att:
+                    att[-1]["email"] = value
+            elif tag == "FileReference":
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment and pending_attachment.get("file_reference"):
+                    cur.setdefault("attachments", []).append(pending_attachment)
+                    pending_attachment = {}
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment["file_reference"] = value
+                cur["_pending_attachment"] = pending_attachment
+            elif tag in ("DisplayName", "AttName", "AttSize", "ContentType", "Method", "IsInline"):
+                attachment_field_mapping = {
+                    "DisplayName": "display_name",
+                    "AttName": "name",
+                    "AttSize": "size",
+                    "ContentType": "content_type",
+                    "Method": "method",
+                    "IsInline": "is_inline",
+                }
+                pending_attachment = cur.get("_pending_attachment")
+                if pending_attachment is None:
+                    pending_attachment = {}
+                pending_attachment[attachment_field_mapping[tag]] = value
+                cur["_pending_attachment"] = pending_attachment
+            elif tag in mapping:
+                cur[mapping[tag]] = value
+            else:
+                if tag not in {"Result", "Properties", "Response", "Store"}:
+                    cur.setdefault("exchange_raw_fields", {}).setdefault(tag, [])
+                    cur["exchange_raw_fields"][tag].append(value)
+        if cur is not None and (cur.get("subject") or cur.get("start")):
+            flush_pending_attachment(cur)
+            events.append(cur)
+        return events

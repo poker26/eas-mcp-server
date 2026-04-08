@@ -6,6 +6,9 @@ Provides tools for reading email, calendar, and contacts via EAS protocol.
 import json
 import os
 import logging
+import base64
+import hashlib
+import re
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -13,6 +16,8 @@ from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict
 
 from eas_client import EASClient, FOLDER_TYPES
+from minio_storage import MinioStorage, MinioStorageConfig
+from ews_client import EWSClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +34,25 @@ EAS_EMAIL = os.environ.get("EAS_EMAIL", "")
 STATE_FILE = os.environ.get("STATE_FILE", "/app/eas_state.json")
 API_KEY = os.environ.get("API_KEY", "")
 YANDEX_MAPS_KEY = os.environ.get("YANDEX_MAPS_KEY", "")
+
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
+MINIO_BUCKET_MEDIA = os.environ.get("MINIO_BUCKET_MEDIA", "")
+MINIO_USE_SSL = os.environ.get("MINIO_USE_SSL", "true").strip().lower() in ("1", "true", "yes", "on")
+
+MINIO_CONFIG = MinioStorageConfig(
+    endpoint=MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    bucket_media=MINIO_BUCKET_MEDIA,
+    use_ssl=MINIO_USE_SSL,
+)
+MINIO_STORAGE = MinioStorage(MINIO_CONFIG)
+
+EWS_URL = os.environ.get("EWS_URL", f"https://{EAS_HOST}/EWS/Exchange.asmx")
+EWS_ENABLED = os.environ.get("EWS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+_global_ews = None
 
 
 # ============================================================
@@ -56,6 +80,15 @@ async def app_lifespan(server):
     logger.info("Connecting to Exchange: %s as %s", EAS_HOST, EAS_USERNAME)
     folders = client.folder_sync()
     logger.info("Found %d folders", len(folders))
+
+    if MINIO_STORAGE.is_enabled():
+        try:
+            MINIO_STORAGE.ensure_bucket_exists()
+            logger.info("MinIO is enabled. Bucket ready: %s", MINIO_BUCKET_MEDIA)
+        except Exception as minio_error:
+            logger.warning("MinIO initialization failed: %s", minio_error)
+    else:
+        logger.info("MinIO is disabled (missing MINIO_* env vars)")
 
     yield {"eas": client}
 
@@ -89,6 +122,453 @@ def get_client(ctx=None) -> EASClient:
         )
         _global_eas.folder_sync()
     return _global_eas
+
+
+def get_ews_client() -> Optional[EWSClient]:
+    global _global_ews
+    if not EWS_ENABLED:
+        return None
+    if not EAS_USERNAME or not EAS_PASSWORD:
+        return None
+    if _global_ews is None:
+        _global_ews = EWSClient(
+            url=EWS_URL,
+            username=EAS_USERNAME,
+            password=EAS_PASSWORD,
+        )
+    return _global_ews
+
+
+def _sanitize_storage_part(raw_value: str, fallback: str) -> str:
+    normalized_value = (raw_value or "").strip()
+    if not normalized_value:
+        return fallback
+    sanitized_value = re.sub(r"[^a-zA-Z0-9._@-]+", "_", normalized_value)
+    return sanitized_value[:160] or fallback
+
+
+def _build_attachment_object_key(event_payload: dict, attachment_payload: dict) -> str:
+    event_identifier = _sanitize_storage_part(
+        str(event_payload.get("uid") or event_payload.get("server_id") or "event"),
+        "event",
+    )
+    source_file_reference = str(attachment_payload.get("file_reference") or "")
+    reference_hash = hashlib.sha1(source_file_reference.encode("utf-8")).hexdigest()[:16]
+    attachment_name = _sanitize_storage_part(
+        str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or "attachment.bin"
+        ),
+        "attachment.bin",
+    )
+    return f"exchange/calendar/{event_identifier}/{reference_hash}-{attachment_name}"
+
+
+def _build_email_attachment_object_key(email_payload: dict, attachment_payload: dict) -> str:
+    email_identifier = _sanitize_storage_part(
+        str(email_payload.get("server_id") or email_payload.get("message_class") or "email"),
+        "email",
+    )
+    source_file_reference = str(attachment_payload.get("file_reference") or "")
+    reference_hash = hashlib.sha1(source_file_reference.encode("utf-8")).hexdigest()[:16]
+    attachment_name = _sanitize_storage_part(
+        str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or "attachment.bin"
+        ),
+        "attachment.bin",
+    )
+    return f"exchange/email/{email_identifier}/{reference_hash}-{attachment_name}"
+
+
+def _enrich_calendar_event_attachments(client: EASClient, event_payload: dict) -> dict:
+    if not MINIO_STORAGE.is_enabled():
+        return event_payload
+
+    raw_attachments = event_payload.get("attachments")
+    if not isinstance(raw_attachments, list) or not raw_attachments:
+        event_payload["attachments"] = []
+        raw_attachments = event_payload["attachments"]
+
+    contains_eas_file_reference = any(
+        str(attachment_payload.get("file_reference") or "").strip()
+        for attachment_payload in raw_attachments
+    )
+    if not contains_eas_file_reference:
+        ews_client = get_ews_client()
+        if ews_client is not None:
+            try:
+                ews_attachments = ews_client.get_calendar_attachment_metadata(
+                    uid=str(event_payload.get("uid") or ""),
+                    subject=str(event_payload.get("subject") or ""),
+                    start_time=str(event_payload.get("start") or ""),
+                )
+                if ews_attachments:
+                    event_payload["attachments"] = ews_attachments
+                    event_payload["attachments_source"] = "ews_fallback"
+            except Exception as ews_error:
+                logger.warning(
+                    "EWS attachment fallback failed for uid=%s subject=%s error=%s",
+                    event_payload.get("uid", ""),
+                    event_payload.get("subject", ""),
+                    ews_error,
+                )
+        return event_payload
+
+    for attachment_payload in raw_attachments:
+        file_reference = str(attachment_payload.get("file_reference") or "").strip()
+        if not file_reference:
+            continue
+
+        object_key = _build_attachment_object_key(event_payload, attachment_payload)
+        attachment_payload["storage_bucket"] = MINIO_BUCKET_MEDIA
+        attachment_payload["storage_object_key"] = object_key
+
+        try:
+            if MINIO_STORAGE.object_exists(object_key):
+                attachment_payload["storage_status"] = "cached"
+                attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+                continue
+
+            attachment_response = client.get_attachment(file_reference)
+            if attachment_response.get("status") != "ok":
+                attachment_payload["storage_status"] = "download_error"
+                attachment_payload["storage_error"] = attachment_response.get("status", "unknown")
+                continue
+
+            raw_data = attachment_response.get("data")
+            if not raw_data:
+                attachment_payload["storage_status"] = "empty_payload"
+                continue
+
+            attachment_bytes = base64.b64decode(raw_data)
+            content_type = str(
+                attachment_payload.get("content_type")
+                or attachment_response.get("content_type")
+                or "application/octet-stream"
+            )
+            MINIO_STORAGE.upload_bytes(
+                object_key=object_key,
+                payload=attachment_bytes,
+                content_type=content_type,
+            )
+
+            attachment_payload["storage_status"] = "uploaded"
+            attachment_payload["content_type"] = content_type
+            attachment_payload["size_bytes"] = len(attachment_bytes)
+            attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+        except Exception as storage_error:
+            attachment_payload["storage_status"] = "storage_error"
+            attachment_payload["storage_error"] = str(storage_error)
+            logger.warning(
+                "Attachment MinIO enrichment failed for event=%s file_reference=%s error=%s",
+                event_payload.get("server_id", ""),
+                file_reference,
+                storage_error,
+            )
+
+    return event_payload
+
+
+def _enrich_calendar_attachments_batch(client: EASClient, events: list) -> list:
+    if not MINIO_STORAGE.is_enabled():
+        return events
+    for event_payload in events:
+        _enrich_calendar_event_attachments(client, event_payload)
+    return events
+
+
+def _enrich_email_attachments_batch(client: EASClient, emails: list) -> list:
+    if not MINIO_STORAGE.is_enabled():
+        return emails
+
+    for email_payload in emails:
+        attachment_list = email_payload.get("attachments")
+        if not isinstance(attachment_list, list) or not attachment_list:
+            continue
+
+        for attachment_payload in attachment_list:
+            file_reference = str(attachment_payload.get("file_reference") or "").strip()
+            if not file_reference:
+                continue
+
+            object_key = _build_email_attachment_object_key(email_payload, attachment_payload)
+            attachment_payload["storage_bucket"] = MINIO_BUCKET_MEDIA
+            attachment_payload["storage_object_key"] = object_key
+
+            try:
+                if MINIO_STORAGE.object_exists(object_key):
+                    attachment_payload["storage_status"] = "cached"
+                    attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+                    continue
+
+                attachment_response = client.get_attachment(file_reference)
+                if attachment_response.get("status") != "ok":
+                    attachment_payload["storage_status"] = "download_error"
+                    attachment_payload["storage_error"] = attachment_response.get("status", "unknown")
+                    continue
+
+                raw_data = attachment_response.get("data")
+                if not raw_data:
+                    attachment_payload["storage_status"] = "empty_payload"
+                    continue
+
+                attachment_bytes = base64.b64decode(raw_data)
+                content_type = str(
+                    attachment_payload.get("content_type")
+                    or attachment_response.get("content_type")
+                    or "application/octet-stream"
+                )
+                attachment_name = str(
+                    attachment_payload.get("display_name")
+                    or attachment_payload.get("name")
+                    or ""
+                ).lower()
+                is_ical_attachment = (
+                    "text/calendar" in content_type.lower()
+                    or attachment_name.endswith(".ics")
+                )
+                if is_ical_attachment:
+                    try:
+                        attachment_payload["ics"] = attachment_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        logger.warning(
+                            "Unable to decode ICS attachment for email=%s file_reference=%s",
+                            email_payload.get("server_id", ""),
+                            file_reference,
+                        )
+                MINIO_STORAGE.upload_bytes(
+                    object_key=object_key,
+                    payload=attachment_bytes,
+                    content_type=content_type,
+                )
+
+                attachment_payload["storage_status"] = "uploaded"
+                attachment_payload["content_type"] = content_type
+                attachment_payload["size_bytes"] = len(attachment_bytes)
+                attachment_payload["presigned_url"] = MINIO_STORAGE.presigned_get_url(object_key)
+            except Exception as storage_error:
+                attachment_payload["storage_status"] = "storage_error"
+                attachment_payload["storage_error"] = str(storage_error)
+                logger.warning(
+                    "Attachment MinIO enrichment failed for email=%s file_reference=%s error=%s",
+                    email_payload.get("server_id", ""),
+                    file_reference,
+                    storage_error,
+                )
+
+    return emails
+
+
+def _normalize_ical_lines(ics_text: str) -> list:
+    """Return unfolded iCalendar lines (RFC 5545 line folding support)."""
+    raw_lines = (ics_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    unfolded_lines = []
+    for raw_line in raw_lines:
+        if not raw_line:
+            continue
+        if raw_line.startswith((" ", "\t")) and unfolded_lines:
+            unfolded_lines[-1] += raw_line[1:]
+        else:
+            unfolded_lines.append(raw_line)
+    return unfolded_lines
+
+
+def _extract_ics_invite_data(ics_text: str) -> dict:
+    """Extract a compact invite payload from VCALENDAR/VEVENT."""
+    unfolded_lines = _normalize_ical_lines(ics_text)
+    if not unfolded_lines:
+        return {}
+
+    in_vevent = False
+    invite_data = {}
+    method_value = ""
+
+    for line in unfolded_lines:
+        if ":" not in line:
+            continue
+        raw_name, raw_value = line.split(":", 1)
+        field_name = raw_name.split(";", 1)[0].strip().upper()
+        field_value = raw_value.strip()
+
+        if field_name == "BEGIN" and field_value.upper() == "VEVENT":
+            in_vevent = True
+            continue
+        if field_name == "END" and field_value.upper() == "VEVENT":
+            in_vevent = False
+            continue
+
+        if field_name == "METHOD":
+            method_value = field_value.upper()
+            continue
+
+        if not in_vevent:
+            continue
+
+        if field_name == "UID":
+            invite_data["uid"] = field_value
+        elif field_name == "SEQUENCE":
+            invite_data["sequence"] = field_value
+        elif field_name == "RECURRENCE-ID":
+            invite_data["recurrence_id"] = field_value
+        elif field_name == "DTSTART":
+            invite_data["start"] = field_value
+        elif field_name == "DTEND":
+            invite_data["end"] = field_value
+        elif field_name == "SUMMARY":
+            invite_data["summary"] = field_value
+        elif field_name == "LOCATION":
+            invite_data["location"] = field_value
+        elif field_name == "STATUS":
+            invite_data["status"] = field_value
+        elif field_name == "ORGANIZER":
+            invite_data["organizer"] = field_value
+
+    if method_value:
+        invite_data["method"] = method_value
+
+    return invite_data
+
+
+def _detect_email_kind(message_class_value: str) -> str:
+    normalized_class = str(message_class_value or "").strip().upper()
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.REQUEST"):
+        return "meeting_invite"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.CANCELED"):
+        return "meeting_cancel"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING.RESP"):
+        return "meeting_response"
+    if normalized_class.startswith("IPM.SCHEDULE.MEETING."):
+        return "meeting_update"
+    return "email"
+
+
+def _build_meeting_dedupe_key(meeting_payload: dict) -> str:
+    uid_value = str(meeting_payload.get("uid") or "")
+    sequence_value = str(meeting_payload.get("sequence") or "0")
+    recurrence_id_value = str(meeting_payload.get("recurrence_id") or "")
+    method_value = str(meeting_payload.get("method") or "")
+    if not uid_value:
+        return ""
+    return "|".join([uid_value, sequence_value, recurrence_id_value, method_value])
+
+
+def _extract_meeting_invite_payload(email_payload: dict) -> dict:
+    attachment_list = email_payload.get("attachments")
+    if not isinstance(attachment_list, list):
+        return {}
+
+    for attachment_payload in attachment_list:
+        content_type = str(attachment_payload.get("content_type") or "").lower()
+        display_name = str(
+            attachment_payload.get("display_name")
+            or attachment_payload.get("name")
+            or ""
+        ).lower()
+
+        looks_like_ics = (
+            "text/calendar" in content_type
+            or display_name.endswith(".ics")
+        )
+        if not looks_like_ics:
+            continue
+
+        raw_ics = attachment_payload.get("ics")
+        if not raw_ics:
+            continue
+
+        parsed_invite = _extract_ics_invite_data(str(raw_ics))
+        if not parsed_invite:
+            continue
+
+        parsed_invite["ics"] = raw_ics
+        return parsed_invite
+
+    return {}
+
+
+def _shape_email_output(email_payload: dict, include_body: bool) -> dict:
+    output_item = {
+        "subject": email_payload.get("subject", ""),
+        "from": email_payload.get("from", ""),
+        "to": email_payload.get("to", ""),
+        "date": email_payload.get("date", ""),
+        "read": email_payload.get("read", "0") == "1",
+    }
+    if email_payload.get("cc"):
+        output_item["cc"] = email_payload["cc"]
+    if include_body and email_payload.get("body"):
+        output_item["body"] = email_payload["body"]
+    if email_payload.get("preview"):
+        output_item["preview"] = email_payload["preview"]
+    if email_payload.get("thread_topic"):
+        output_item["thread_topic"] = email_payload["thread_topic"]
+    if email_payload.get("message_class"):
+        output_item["message_class"] = email_payload["message_class"]
+    if email_payload.get("attachments"):
+        output_item["attachments"] = email_payload["attachments"]
+
+    email_kind = _detect_email_kind(email_payload.get("message_class", ""))
+    output_item["email_kind"] = email_kind
+
+    meeting_payload = _extract_meeting_invite_payload(email_payload)
+    if meeting_payload:
+        output_item["meeting"] = meeting_payload
+        dedupe_key = _build_meeting_dedupe_key(meeting_payload)
+        if dedupe_key:
+            output_item["dedupe_key"] = dedupe_key
+
+    return output_item
+
+
+def _collect_exchange_tag_statistics(elements: list, max_windows: int = 12) -> dict:
+    interesting_tags = {
+        "Attachments",
+        "Attachment",
+        "FileReference",
+        "DisplayName",
+        "AttName",
+        "AttSize",
+        "EstimatedDataSize",
+        "ContentType",
+        "Method",
+        "IsInline",
+        "Body",
+        "BodyPreference",
+        "ApplicationData",
+        "ServerId",
+        "Subject",
+    }
+
+    tag_counts = {}
+    attachment_windows = []
+
+    for index, (depth, tag, value) in enumerate(elements):
+        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        if tag in interesting_tags and len(attachment_windows) < max_windows:
+            start_index = max(0, index - 4)
+            end_index = min(len(elements), index + 5)
+            window = []
+            for depth_value, tag_value, raw_value in elements[start_index:end_index]:
+                normalized_value = raw_value
+                if isinstance(normalized_value, str) and len(normalized_value) > 160:
+                    normalized_value = normalized_value[:160] + "...<truncated>"
+                window.append({
+                    "depth": depth_value,
+                    "tag": tag_value,
+                    "value": normalized_value,
+                })
+            attachment_windows.append(window)
+
+    sorted_counts = sorted(tag_counts.items(), key=lambda pair: pair[1], reverse=True)
+    return {
+        "total_elements": len(elements),
+        "top_tags": sorted_counts[:40],
+        "attachment_related_windows": attachment_windows,
+    }
 
 
 # ============================================================
@@ -253,31 +733,18 @@ async def exchange_get_emails(folder_id: str = None, max_items: int = 25, includ
         }, ensure_ascii=False)
 
     emails = client.parse_emails(result["elements"])
+    emails = _enrich_email_attachments_batch(client, emails)
 
     # Trim to max
     emails = emails[:max_items]
 
     # Clean up for output
     output = []
-    for e in emails:
-        item = {
-            "subject": e.get("subject", "(no subject)"),
-            "from": e.get("from", ""),
-            "to": e.get("to", ""),
-            "date": e.get("date", ""),
-            "read": e.get("read", "0") == "1",
-        }
-        if e.get("cc"):
-            item["cc"] = e["cc"]
-        if e.get("importance"):
+    for email_payload in emails:
+        item = _shape_email_output(email_payload, include_body)
+        if email_payload.get("importance"):
             item["importance"] = {"0": "low", "1": "normal", "2": "high"}.get(
-                e["importance"], e["importance"])
-        if include_body and e.get("body"):
-            item["body"] = e["body"]
-        if e.get("preview"):
-            item["preview"] = e["preview"]
-        if e.get("thread_topic"):
-            item["thread_topic"] = e["thread_topic"]
+                email_payload["importance"], email_payload["importance"])
         output.append(item)
 
     return json.dumps({
@@ -327,20 +794,38 @@ async def exchange_get_calendar(
     if not fid:
         return json.dumps({"error": "Calendar folder not found."})
 
-    result = client.sync_folder(fid, window_size=max_items, body_type="1", body_size="4096")
+    result = client.search_calendar(
+        fid,
+        date_from=date_from,
+        date_to=date_to,
+        max_items=max_items,
+    )
+    events = client.parse_search_calendar(result.get("elements", []))
+    search_total = result.get("total", 0)
 
-    if not result.get("elements"):
-        return json.dumps({"events": [], "count": 0, "date_from": date_from, "date_to": date_to}, ensure_ascii=False)
+    if (date_from or date_to) and search_total == 0:
+        logger.warning(
+            "exchange_get_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
+            fid, date_from, date_to,
+        )
+        fallback = client.sync_folder(
+            fid,
+            window_size=max_items,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+        events = client.parse_calendar(fallback.get("elements", []))
 
-    events = client.parse_calendar(result["elements"])
-
-    # Filter by date range, expanding recurring events
+    # Expand recurring events if a date range is specified
     if date_from or date_to:
         df = date_from.replace("-", "") if date_from else "00000000"
         dt = date_to.replace("-", "") if date_to else "99999999"
         events = client.expand_recurring(events, df, dt)
     else:
         events.sort(key=lambda e: e.get("start", ""))
+
+    events = _enrich_calendar_attachments_batch(client, events)
 
     return json.dumps({
         "events": events,
@@ -582,14 +1067,12 @@ async def api_emails(
     fid = folder_id or c.find_folder(2)
     body_size = "51200" if body else "0"
     r = c.sync_folder(fid, window_size=max, body_type="1", body_size=body_size)
-    emails = c.parse_emails(r.get("elements", []))[:max]
+    emails = c.parse_emails(r.get("elements", []))
+    emails = _enrich_email_attachments_batch(c, emails)
+    emails = emails[:max]
     output = []
-    for e in emails:
-        item = {"subject": e.get("subject", ""), "from": e.get("from", ""), "to": e.get("to", ""), "date": e.get("date", ""), "read": e.get("read", "0") == "1"}
-        if e.get("cc"): item["cc"] = e["cc"]
-        if body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, body))
     return {"emails": output, "count": len(output)}
 
 
@@ -636,8 +1119,6 @@ async def api_calendar(
     _verify_key(x_api_key, authorization)
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
-    r = c.sync_folder(fid, window_size=max, body_type="1", body_size="4096")
-    events = c.parse_calendar(r.get("elements", []))
 
     # Handle date shortcut
     df = date_from
@@ -646,12 +1127,31 @@ async def api_calendar(
         df = date
         dt = date
 
+    r = c.search_calendar(fid, date_from=df or "", date_to=dt or "", max_items=max)
+    events = c.parse_search_calendar(r.get("elements", []))
+    search_total = r.get("total", 0)
+
+    if (df or dt) and search_total == 0:
+        logger.warning(
+            "api_calendar: Search returned total=0, fallback to sync_folder for fid=%s range=%s..%s",
+            fid, df, dt,
+        )
+        fallback = c.sync_folder(
+            fid,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+        events = c.parse_calendar(fallback.get("elements", []))
+
     if df or dt:
         df_s = (df or "").replace("-", "") or "00000000"
         dt_s = (dt or "").replace("-", "") or "99999999"
         events = c.expand_recurring(events, df_s, dt_s)
 
     events.sort(key=lambda e: e.get("start", ""))
+    events = _enrich_calendar_attachments_batch(c, events)
     return {"events": events, "count": len(events), "date_from": df, "date_to": dt}
 
 
@@ -720,13 +1220,10 @@ async def api_new_emails(
     body_size = "51200" if body else "0"
     result = c.sync_incremental(fid, window_size=max, body_type="1", body_size=body_size)
     emails = c.parse_emails(result.get("elements", []))
+    emails = _enrich_email_attachments_batch(c, emails)
     output = []
-    for e in emails:
-        item = {"subject": e.get("subject",""), "from": e.get("from",""), "to": e.get("to",""), "date": e.get("date",""), "read": e.get("read","0") == "1"}
-        if e.get("cc"): item["cc"] = e["cc"]
-        if body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, body))
     return {"emails": output, "count": len(output), "is_initial": result.get("is_initial", False)}
 
 
@@ -741,9 +1238,213 @@ async def api_new_events(
     _verify_key(x_api_key, authorization)
     c = _rest_client()
     fid = folder_id or c.find_folder(8)
-    result = c.sync_incremental(fid, window_size=max, body_type="1", body_size="4096")
-    events = c.parse_calendar(result.get("elements", []))
-    return {"events": events, "count": len(events), "is_initial": result.get("is_initial", False)}
+    result = c.sync_incremental(
+        fid,
+        window_size=max,
+        body_type="1",
+        body_size="4096",
+        include_attachments=True,
+    )
+    delta = c.parse_calendar_delta(result.get("elements", []))
+    delta["added"] = _enrich_calendar_attachments_batch(c, delta["added"])
+    delta["changed"] = _enrich_calendar_attachments_batch(c, delta["changed"])
+    events = delta["added"] + delta["changed"]
+    return {
+        "events": events,  # backward compatibility
+        "added": delta["added"],
+        "changed": delta["changed"],
+        "deleted": delta["deleted"],
+        "count": len(events),
+        "is_initial": result.get("is_initial", False),
+    }
+
+
+@api.get("/api/debug/calendar_sync", tags=["Debug"], summary="Debug raw calendar Sync payload")
+async def api_debug_calendar_sync(
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    mode: str = Query("incremental", description="incremental or snapshot"),
+    max: int = Query(50, ge=1, le=200, description="Window size for Sync"),
+    subject: str = Query("", description="Optional exact subject to locate in raw tags"),
+    preview_limit: int = Query(250, ge=50, le=5000, description="Number of raw elements to include in preview"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Return raw Exchange Sync tags for calendar troubleshooting.
+
+    This endpoint is for protocol diagnostics only. It helps verify which exact
+    WBXML tags Exchange returned (including attachment-related fields).
+    """
+    _verify_key(x_api_key, authorization)
+    client = _rest_client()
+    selected_folder_id = folder_id or client.find_folder(8)
+
+    if not selected_folder_id:
+        return {
+            "error": "Calendar folder not found",
+            "folder_id": selected_folder_id,
+        }
+
+    normalized_mode = (mode or "incremental").strip().lower()
+    if normalized_mode not in ("incremental", "snapshot"):
+        raise HTTPException(status_code=400, detail="mode must be 'incremental' or 'snapshot'")
+
+    if normalized_mode == "snapshot":
+        sync_result = client.sync_folder(
+            selected_folder_id,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+    else:
+        sync_result = client.sync_incremental(
+            selected_folder_id,
+            window_size=max,
+            body_type="1",
+            body_size="4096",
+            include_attachments=True,
+        )
+
+    raw_elements = sync_result.get("elements", [])
+    parsed_delta = client.parse_calendar_delta(raw_elements)
+
+    subject_windows = []
+    target_subject = (subject or "").strip()
+    if target_subject:
+        for index, (depth, tag, value) in enumerate(raw_elements):
+            if tag == "Subject" and value == target_subject:
+                start_index = max(0, index - 25)
+                end_index = min(len(raw_elements), index + 50)
+                subject_windows.append([
+                    {
+                        "depth": depth_value,
+                        "tag": tag_value,
+                        "value": raw_value if not isinstance(raw_value, str) or len(raw_value) <= 200 else raw_value[:200] + "...<truncated>",
+                    }
+                    for depth_value, tag_value, raw_value in raw_elements[start_index:end_index]
+                ])
+
+    return {
+        "request": {
+            "folder_id": selected_folder_id,
+            "mode": normalized_mode,
+            "window_size": max,
+            "body_type": "1",
+            "body_size": "4096",
+            "include_attachments": True,
+            "mime_support": "2",
+            "mime_truncation": "0",
+        },
+        "sync_meta": {
+            "status": sync_result.get("status"),
+            "sync_key": sync_result.get("sync_key"),
+            "is_initial": sync_result.get("is_initial", False),
+        },
+        "parsed_counts": {
+            "added": len(parsed_delta.get("added", [])),
+            "changed": len(parsed_delta.get("changed", [])),
+            "deleted": len(parsed_delta.get("deleted", [])),
+        },
+        "raw_tag_stats": _collect_exchange_tag_statistics(raw_elements),
+        "subject_search": {
+            "target_subject": target_subject,
+            "hits": len(subject_windows),
+            "windows": subject_windows[:8],
+        },
+        "raw_elements_preview": [
+            {
+                "depth": depth,
+                "tag": tag,
+                "value": value if not isinstance(value, str) or len(value) <= 200 else value[:200] + "...<truncated>",
+            }
+            for depth, tag, value in raw_elements[:preview_limit]
+        ],
+    }
+
+
+@api.get("/api/debug/calendar_item", tags=["Debug"], summary="Debug single calendar item fetch by ServerId")
+async def api_debug_calendar_item(
+    server_id: str = Query(..., description="Calendar item ServerId, e.g. 9:111"),
+    folder_id: Optional[str] = Query(None, description="Calendar folder ServerId"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    """Fetch a single calendar item via ItemOperations/Fetch and return raw+parsed data."""
+    _verify_key(x_api_key, authorization)
+    client = _rest_client()
+    selected_folder_id = folder_id or client.find_folder(8)
+
+    if not selected_folder_id:
+        return {"error": "Calendar folder not found", "folder_id": selected_folder_id}
+
+    fetch_result = client.item_operations_fetch_calendar_item(
+        collection_id=selected_folder_id,
+        server_id=server_id,
+        body_type="1",
+        body_size="4096",
+    )
+    raw_elements = fetch_result.get("elements", [])
+    parsed_events = client.parse_calendar(raw_elements)
+    selected_event = None
+    for event_payload in parsed_events:
+        if event_payload.get("server_id") == server_id:
+            selected_event = event_payload
+            break
+
+    return {
+        "request": {
+            "folder_id": selected_folder_id,
+            "server_id": server_id,
+            "command": "ItemOperations",
+            "operation": "Fetch",
+            "body_type": "1",
+            "body_size": "4096",
+        },
+        "fetch_meta": {
+            "status": fetch_result.get("status"),
+            "top_level_status": fetch_result.get("top_level_status"),
+            "fetch_status": fetch_result.get("fetch_status"),
+            "requested_server_id": fetch_result.get("requested_server_id"),
+            "raw_elements_count": len(raw_elements),
+            "parsed_events_count": len(parsed_events),
+        },
+        "event": selected_event,
+        "raw_tag_stats": _collect_exchange_tag_statistics(raw_elements),
+        "raw_elements_preview": [
+            {
+                "depth": depth,
+                "tag": tag,
+                "value": value if not isinstance(value, str) or len(value) <= 200 else value[:200] + "...<truncated>",
+            }
+            for depth, tag, value in raw_elements[:500]
+        ],
+    }
+
+
+@api.get("/api/debug/calendar_item_ews", tags=["Debug"], summary="Debug EWS calendar attachment metadata")
+async def api_debug_calendar_item_ews(
+    uid: str = Query("", description="Calendar UID"),
+    subject: str = Query("", description="Calendar subject"),
+    start: str = Query("", description="Calendar start time (EAS compact or ISO UTC)"),
+    x_api_key: str = Header(default=None),
+    authorization: str = Header(default=None),
+):
+    _verify_key(x_api_key, authorization)
+    ews_client = get_ews_client()
+    if ews_client is None:
+        return {"error": "EWS fallback is disabled"}
+    attachments = ews_client.get_calendar_attachment_metadata(
+        uid=uid,
+        subject=subject,
+        start_time=start,
+    )
+    return {
+        "uid": uid,
+        "subject": subject,
+        "start": start,
+        "attachments_count": len(attachments),
+        "attachments": attachments,
+    }
 
 
 @api.get("/api/attachment", tags=["Email"], summary="Download attachment")
@@ -840,20 +1541,11 @@ async def exchange_get_new_emails(
     )
 
     emails = client.parse_emails(result.get("elements", []))
+    emails = _enrich_email_attachments_batch(client, emails)
 
     output = []
-    for e in emails:
-        item = {
-            "subject": e.get("subject", ""),
-            "from": e.get("from", ""),
-            "to": e.get("to", ""),
-            "date": e.get("date", ""),
-            "read": e.get("read", "0") == "1",
-        }
-        if e.get("cc"): item["cc"] = e["cc"]
-        if include_body and e.get("body"): item["body"] = e["body"]
-        if e.get("preview"): item["preview"] = e["preview"]
-        output.append(item)
+    for email_payload in emails:
+        output.append(_shape_email_output(email_payload, include_body))
 
     return json.dumps({
         "emails": output,
@@ -899,12 +1591,19 @@ async def exchange_get_new_events(
     result = client.sync_incremental(
         fid, window_size=max_items,
         body_type="1", body_size="4096",
+        include_attachments=True,
     )
 
-    events = client.parse_calendar(result.get("elements", []))
+    delta = client.parse_calendar_delta(result.get("elements", []))
+    delta["added"] = _enrich_calendar_attachments_batch(client, delta["added"])
+    delta["changed"] = _enrich_calendar_attachments_batch(client, delta["changed"])
+    events = delta["added"] + delta["changed"]
 
     return json.dumps({
-        "events": events,
+        "events": events,  # backward compatibility
+        "added": delta["added"],
+        "changed": delta["changed"],
+        "deleted": delta["deleted"],
         "count": len(events),
         "is_initial": result.get("is_initial", False),
         "status": result.get("status"),

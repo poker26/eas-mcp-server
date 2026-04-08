@@ -1,0 +1,933 @@
+{
+  "name": "EAS: New Emails & Events → Telegram, YA",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "912573fe-1c0a-4326-9de4-11ae791fe221",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        544,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://easmcp.begemot26.ru/api/new_emails?max=50&body=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a9651ad6-885c-4696-86b7-ab70914f15de",
+      "name": "Get New Emails",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        224
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "Sj3gSkd8lIlqveF7",
+          "name": "Header Auth MCP email"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://easmcp.begemot26.ru/api/new_events?max=50",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "74d0b02f-4fce-4b9a-8d22-e54a6c59aa5a",
+      "name": "Get New Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "Sj3gSkd8lIlqveF7",
+          "name": "Header Auth MCP email"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process new emails\nconst emailData = $('Get New Emails').first().json;\nconst emails = emailData.emails || [];\nconst messages = [];\n\nfunction escHtml(s) {\n  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction sanitizeUid(rawUid) {\n  return String(rawUid || '').replace(/[^a-zA-Z0-9@._-]/g, '_');\n}\n\nfor (const e of emails) {\n  if (emailData.is_initial) continue;\n\n  const read = e.read ? '📖' : '📩';\n  let text = `${read} <b>${escHtml(e.subject) || '(без темы)'}</b>\\n`;\n  text += `👤 ${escHtml(e.from)}\\n`;\n  if (e.date) {\n    const d = new Date(e.date);\n    const dateStr = d.toLocaleString('ru-RU', {\n      timeZone: 'Europe/Moscow',\n      day: 'numeric', month: 'short',\n      hour: '2-digit', minute: '2-digit', hour12: false,\n    });\n    text += `🕐 ${dateStr} МСК\\n`;\n  }\n\n  if (e.message_class) {\n    text += `🧾 ${escHtml(e.message_class)}\\n`;\n  }\n\n  const body = (e.body || '') + ' ' + (e.preview || '');\n  const linkPatterns = [\n    /https:\\/\\/[\\w.-]*zoom\\.us\\/[^\\s<\\\"]+/gi,\n    /https:\\/\\/telemost\\.yandex\\.(?:ru|com)\\/[^\\s<\\\"]+/gi,\n    /https:\\/\\/meet\\.google\\.com\\/[^\\s<\\\"]+/gi,\n    /https:\\/\\/teams\\.microsoft\\.com\\/[^\\s<\\\"]+/gi,\n  ];\n\n  const links = [];\n  for (const pattern of linkPatterns) {\n    const matches = body.match(pattern);\n    if (matches) links.push(...matches);\n  }\n\n  if (links.length > 0) {\n    text += `\\n🔗 Ссылки:\\n`;\n    for (const link of [...new Set(links)]) {\n      text += `${link}\\n`;\n    }\n  }\n\n  messages.push({ type: 'email', text });\n\n  const meeting = e.meeting || null;\n  const emailKind = String(e.email_kind || 'email');\n  const hasMeetingIcs = meeting && typeof meeting.ics === 'string' && meeting.ics.trim().length > 0;\n  const meetingUidRaw = meeting ? (meeting.uid || '') : '';\n  const meetingUid = sanitizeUid(meetingUidRaw);\n  const dedupeKey = e.dedupe_key || (meetingUid ? `${meetingUid}|fallback` : '');\n\n  if (hasMeetingIcs && meetingUid) {\n    const meetingSummary = meeting.summary || e.subject || '(без темы)';\n    const method = String(meeting.method || '').toUpperCase();\n\n    if (emailKind === 'meeting_cancel' || method === 'CANCEL') {\n      messages.push({\n        type: 'meeting_delete',\n        uid: meetingUid,\n        dedupe_key: dedupeKey,\n        text: `❌ Отмена встречи: <b>${escHtml(meetingSummary)}</b>`\n      });\n    } else {\n      messages.push({\n        type: 'meeting_caldav',\n        uid: meetingUid,\n        ical: meeting.ics,\n        dedupe_key: dedupeKey\n      });\n\n      messages.push({\n        type: 'meeting_notice',\n        dedupe_key: dedupeKey,\n        text: `📆 Встреча: <b>${escHtml(meetingSummary)}</b>\\nСинхронизировано в Яндекс.Календарь`\n      });\n    }\n  }\n\n  const attachments = Array.isArray(e.attachments) ? e.attachments : [];\n  for (const attachment of attachments) {\n    const documentUrl = attachment.presigned_url;\n    if (!documentUrl) continue;\n\n    const attachmentName = attachment.display_name || attachment.name || 'attachment';\n    const attachmentCaption = `📎 <b>${escHtml(attachmentName)}</b>\\nИз письма: ${escHtml(e.subject || '(без темы)')}`;\n\n    messages.push({\n      type: 'email_attachment',\n      text: attachmentCaption,\n      document_url: documentUrl\n    });\n  }\n}\n\nreturn messages.length > 0 ? messages.map(m => ({ json: m })) : [{ json: { type: 'none' } }];"
+      },
+      "id": "1eaa1575-2b86-416b-921d-fa815bb76903",
+      "name": "Format Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function escHtml(s) {\n  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction parseEASDate(raw) {\n  if (!raw) return null;\n  if (raw.includes('-')) return new Date(raw);\n  const s = raw.replace(/^(\\d{4})(\\d{2})(\\d{2})T(\\d{2})(\\d{2})(\\d{2})(Z?)$/, '$1-$2-$3T$4:$5:$6$7');\n  return new Date(s);\n}\n\nfunction toMSKTime(raw) {\n  const date = parseEASDate(raw);\n  if (!date || isNaN(date)) return '??:??';\n  return date.toLocaleTimeString('ru-RU', {\n    timeZone: 'Europe/Moscow',\n    hour: '2-digit',\n    minute: '2-digit',\n    hour12: false\n  });\n}\n\nfunction toMSKDate(raw) {\n  const date = parseEASDate(raw);\n  if (!date || isNaN(date)) return '?';\n  return date.toLocaleDateString('ru-RU', {\n    timeZone: 'Europe/Moscow',\n    day: 'numeric',\n    month: 'short'\n  });\n}\n\nfunction formatEventText(event, prefix) {\n  const startTime = toMSKTime(event.start);\n  const endTime = toMSKTime(event.end);\n  const dateStr = toMSKDate(event.start);\n\n  let text = `${prefix} <b>${escHtml(event.subject || '(без темы)')}</b>\\n`;\n  text += `🕐 ${dateStr}, ${startTime}–${endTime} МСК\\n`;\n\n  if (event.location) {\n    text += `📍 ${escHtml(event.location)}\\n`;\n  }\n\n  if (event.organizer_name) {\n    text += `👤 ${escHtml(event.organizer_name)}\\n`;\n  }\n\n  const searchableText = `${event.body || ''} ${event.location || ''}`;\n  const meetingLink = searchableText.match(/https:\\/\\/[\\w.-]*(?:zoom\\.us|telemost\\.yandex|meet\\.google|teams\\.microsoft)[^\\s<\\\"]*/i);\n  if (meetingLink) {\n    text += `🔗 ${meetingLink[0]}\\n`;\n  }\n\n  if (event.attendees && event.attendees.length > 0) {\n    const attendees = event.attendees\n      .map((attendee) => attendee.name || attendee.email)\n      .filter(Boolean)\n      .slice(0, 5);\n    if (attendees.length > 0) {\n      text += `👥 ${escHtml(attendees.join(', '))}\\n`;\n    }\n  }\n\n  return text;\n}\n\nconst eventData = $('Get New Events').first().json || {};\n\nif (eventData.is_initial) {\n  return [{ json: { type: 'none' } }];\n}\n\nconst addedEvents = Array.isArray(eventData.added)\n  ? eventData.added\n  : (Array.isArray(eventData.events) ? eventData.events : []);\n\nconst changedEvents = Array.isArray(eventData.changed) ? eventData.changed : [];\nconst deletedEvents = Array.isArray(eventData.deleted) ? eventData.deleted : [];\n\nconst messages = [];\n\nfor (const event of addedEvents) {\n  messages.push({\n    type: 'event',\n    text: formatEventText(event, '📅'),\n    event\n  });\n}\n\nfor (const event of changedEvents) {\n  messages.push({\n    type: 'event_changed',\n    text: formatEventText(event, '✏️'),\n    event\n  });\n}\n\nfor (const event of deletedEvents) {\n  messages.push({\n    type: 'event_deleted',\n    server_id: event.server_id || '',\n    uid: event.uid || ''\n  });\n}\n\nreturn messages.length > 0\n  ? messages.map((message) => ({ json: message }))\n  : [{ json: { type: 'none' } }];"
+      },
+      "id": "4baf1859-af25-4ca1-bcd1-681ab2ab9ceb",
+      "name": "Format Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "1",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "none",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0f386ac8-3b20-4bd5-9c1b-9099b7378dc7",
+      "name": "Has New Emails?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "1",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "event",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "e5ac7d8f-b5a6-4f32-8ba4-1a81be758184",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "event_changed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "7f16b742-3b5b-4abc-8f3a-e4f0becb6c5f",
+      "name": "Has New Events?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "4683166",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "2df69a58-f348-4dee-aa07-c03a39c889e5",
+      "name": "TG: New Email",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1504,
+        224
+      ],
+      "webhookId": "dc4c85cc-fb24-422f-9772-85a9a3aa580d",
+      "credentials": {
+        "telegramApi": {
+          "id": "jPCXfnH34oj0dcqV",
+          "name": "TG for TESTS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "emailOnly",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "email",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b6bf7ece-2d5e-41d5-a5c5-26829ab4f7f6",
+      "name": "Has Email Text?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "attachmentOnly",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "email_attachment",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9b6b0b89-f571-4e6f-b89e-10e8cd94af0a",
+      "name": "Has Email Attachments?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "4683166",
+        "binaryData": false,
+        "document": "={{ $json.document_url }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "caption": "={{ $json.text }}",
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "3d5e8530-6f13-4f46-bce4-e7f8f1165aa3",
+      "name": "TG: Email Attachment",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1664,
+        304
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "jPCXfnH34oj0dcqV",
+          "name": "TG for TESTS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "meetingAny",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_caldav",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "meetingAny2",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_delete",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "meetingAny3",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_notice",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "53be9f19-e57c-4d6f-9e28-355a11dce5ac",
+      "name": "Has Meeting Ops?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst globalState = $getWorkflowStaticData('global');\n\nif (!globalState.seenMeetingDedupe) {\n  globalState.seenMeetingDedupe = {};\n}\n\nconst seenDedupeMap = globalState.seenMeetingDedupe;\nconst nowTimestamp = Date.now();\nconst keepForMs = 7 * 24 * 60 * 60 * 1000;\n\nfor (const dedupeKey of Object.keys(seenDedupeMap)) {\n  if (nowTimestamp - Number(seenDedupeMap[dedupeKey] || 0) > keepForMs) {\n    delete seenDedupeMap[dedupeKey];\n  }\n}\n\nconst output = [];\nfor (const item of items) {\n  const dedupeKey = String(item.json.dedupe_key || '').trim();\n  if (!dedupeKey) {\n    output.push(item);\n    continue;\n  }\n\n  if (seenDedupeMap[dedupeKey]) {\n    continue;\n  }\n\n  seenDedupeMap[dedupeKey] = nowTimestamp;\n  output.push(item);\n}\n\nreturn output.length > 0 ? output : [{ json: { type: 'none' } }];\n"
+      },
+      "id": "4df1f6f3-5032-44ff-b0da-13f5f50f9a59",
+      "name": "Deduplicate Meeting Ops",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "meetingPut",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_caldav",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ae71626f-19f7-43f2-8dfd-47d90695f07f",
+      "name": "Has Meeting Upsert?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "meetingDelete",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_delete",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "abf5de2f-4003-4ff9-becc-1e3f3e0f5622",
+      "name": "Has Meeting Delete?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "meetingNotice",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "meeting_notice",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "650ff859-6116-4956-8c3d-3c65c8ecbd4e",
+      "name": "Has Meeting Notice?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "4683166",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "a548d1b0-f334-410d-afb1-656d2e2ee62b",
+      "name": "TG: Meeting Notice",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2048,
+        640
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "jPCXfnH34oj0dcqV",
+          "name": "TG for TESTS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://caldav.yandex.ru/calendars/superkerogaz%40yandex.ru/events-default/{{ $json.uid }}.ics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "text/calendar; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "body": "={{ $json.ical }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "9f02f748-cfb2-43e8-b2c9-f22fb7a7d1bf",
+      "name": "CalDAV PUT Meeting ICS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2048,
+        384
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "xMgPynwFvCerpDZe",
+          "name": "Yandex CalDAWS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://caldav.yandex.ru/calendars/superkerogaz%40yandex.ru/events-default/{{ $json.uid }}.ics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "62900822-cf8b-4885-a6b3-df139d40fabd",
+      "name": "CalDAV DELETE Meeting",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2048,
+        512
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "xMgPynwFvCerpDZe",
+          "name": "Yandex CalDAWS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "4683166",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "eb168065-1bc2-4d8d-82f2-de3a3f76338c",
+      "name": "TG: New Event",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1600,
+        480
+      ],
+      "webhookId": "d7101165-6778-48cd-a563-76722a105151",
+      "credentials": {
+        "telegramApi": {
+          "id": "jPCXfnH34oj0dcqV",
+          "name": "TG for TESTS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const { type, event: ev } = item.json;\n  if (type !== 'event' && type !== 'event_changed') continue;\n  if (!ev) continue;\n\n  const uid = (ev.uid || ev.server_id || `eas-${Date.now()}-${Math.random().toString(36).substr(2,8)}`)\n    .replace(/[^a-zA-Z0-9@._-]/g, '_');\n\n  function toICalUTC(raw) {\n    if (!raw) return '';\n    if (/^\\d{8}T\\d{6}Z$/.test(raw)) return raw;\n    if (/^\\d{8}T\\d{6}$/.test(raw)) return raw + 'Z';\n    return new Date(raw).toISOString().replace(/[-:]/g, '').replace(/\\.\\d{3}/, '');\n  }\n  function icalEsc(s) {\n    return (s || '').replace(/\\\\/g, '\\\\\\\\').replace(/;/g, '\\\\;').replace(/,/g, '\\\\,').replace(/[\\r\\n]+/g, '\\\\n');\n  }\n\n  const dtstart = toICalUTC(ev.start);\n  const dtend = toICalUTC(ev.end);\n  const now = toICalUTC(new Date().toISOString());\n\n  let ical = 'BEGIN:VCALENDAR\\r\\n';\n  ical += 'VERSION:2.0\\r\\n';\n  ical += 'PRODID:-//EAS MCP//EN\\r\\n';\n  ical += 'BEGIN:VEVENT\\r\\n';\n  ical += `UID:${uid}\\r\\n`;\n  ical += `DTSTAMP:${now}\\r\\n`;\n  ical += `DTSTART:${dtstart}\\r\\n`;\n  ical += `DTEND:${dtend}\\r\\n`;\n  ical += `SUMMARY:${icalEsc(ev.subject)}\\r\\n`;\n  if (ev.location) ical += `LOCATION:${icalEsc(ev.location)}\\r\\n`;\n  if (ev.organizer_email) ical += `ORGANIZER;CN=\"${icalEsc(ev.organizer_name || '')}\":mailto:${ev.organizer_email}\\r\\n`;\n  if (ev.attendees) {\n    for (const a of ev.attendees) ical += `ATTENDEE;CN=\"${icalEsc(a.name || '')}\":mailto:${a.email || ''}\\r\\n`;\n  }\n  if (ev.body) ical += `DESCRIPTION:${icalEsc(ev.body.substring(0, 500))}\\r\\n`;\n  if (ev.all_day === '1') ical += 'X-MICROSOFT-CDO-ALLDAYEVENT:TRUE\\r\\n';\n  ical += 'END:VEVENT\\r\\n';\n  ical += 'END:VCALENDAR\\r\\n';\n\n  results.push({ json: { uid, ical, subject: ev.subject, start: ev.start, op: type } });\n}\n\nreturn results.length > 0 ? results : [{ json: { skip: true } }];\n"
+      },
+      "id": "59297c8a-b6f2-4232-8b9e-8febdfc77b0e",
+      "name": "Convert to iCal",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://caldav.yandex.ru/calendars/superkerogaz%40yandex.ru/events-default/{{ $json.uid }}.ics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "text/calendar; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "body": "={{ $json.ical }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "be479b73-24d9-41e3-b456-2775312e3219",
+      "name": "CalDAV PUT to Yandex",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        656
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "xMgPynwFvCerpDZe",
+          "name": "Yandex CalDAWS"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "del1",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "event_deleted",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4802788-3ef0-4db2-84bf-11fec3294f67",
+      "name": "Has Deleted?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nreturn items\n  .filter((item) => item.json.type === 'event_deleted')\n  .map((item) => {\n    const rawUid = item.json.uid || item.json.server_id || '';\n    const sanitizedUid = rawUid.replace(/[^a-zA-Z0-9@._-]/g, '_');\n\n    return {\n      json: {\n        uid: sanitizedUid\n      }\n    };\n  });\n"
+      },
+      "id": "102b105f-6b3a-4ff9-a01f-38027ab00b00",
+      "name": "Build Delete UID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        816
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://caldav.yandex.ru/calendars/superkerogaz%40yandex.ru/events-default/{{ $json.uid }}.ics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "5dd71481-853e-4d3b-93bf-0426de68d327",
+      "name": "CalDAV DELETE",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        832
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "xMgPynwFvCerpDZe",
+          "name": "Yandex CalDAWS"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Get New Emails",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get New Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get New Emails": {
+      "main": [
+        [
+          {
+            "node": "Format Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get New Events": {
+      "main": [
+        [
+          {
+            "node": "Format Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Emails": {
+      "main": [
+        [
+          {
+            "node": "Has New Emails?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Events": {
+      "main": [
+        [
+          {
+            "node": "Has New Events?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Deleted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has New Emails?": {
+      "main": [
+        [
+          {
+            "node": "Has Email Text?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Email Attachments?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Meeting Ops?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email Text?": {
+      "main": [
+        [
+          {
+            "node": "TG: New Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email Attachments?": {
+      "main": [
+        [
+          {
+            "node": "TG: Email Attachment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Meeting Ops?": {
+      "main": [
+        [
+          {
+            "node": "Deduplicate Meeting Ops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deduplicate Meeting Ops": {
+      "main": [
+        [
+          {
+            "node": "Has Meeting Upsert?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Meeting Delete?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Meeting Notice?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Meeting Upsert?": {
+      "main": [
+        [
+          {
+            "node": "CalDAV PUT Meeting ICS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Meeting Delete?": {
+      "main": [
+        [
+          {
+            "node": "CalDAV DELETE Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Meeting Notice?": {
+      "main": [
+        [
+          {
+            "node": "TG: Meeting Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has New Events?": {
+      "main": [
+        [
+          {
+            "node": "TG: New Event",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Convert to iCal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to iCal": {
+      "main": [
+        [
+          {
+            "node": "CalDAV PUT to Yandex",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Deleted?": {
+      "main": [
+        [
+          {
+            "node": "Build Delete UID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Delete UID": {
+      "main": [
+        [
+          {
+            "node": "CalDAV DELETE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "e9c5e845-35bb-46c7-bc8e-3d34d7cdb09c",
+  "meta": {
+    "instanceId": "37c1bec5477bc5881c36f29ac7b9dab276628a9c7b18952c9c8961bf5c12fae5"
+  },
+  "id": "qJ9SJ6nLXINq7IHH",
+  "tags": []
+}
