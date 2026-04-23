@@ -6,6 +6,9 @@ Handles WBXML encoding/decoding and EAS protocol commands.
 import io
 import json
 import logging
+import os
+import threading
+import time
 import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -267,22 +270,61 @@ class EASClient:
         self.sync_keys: dict = {}
         self.incr_keys: dict = {}
         self.state_file = state_file or ""
+        # Serializes HTTP calls and multi-step sync sequences so concurrent
+        # MCP requests don't race on SyncKey / state file.
+        self._lock = threading.RLock()
         if self.state_file:
             self._load_state()
 
     def close(self):
         self.client.close()
 
+    # Retry on transient failures: EAS spec lists 449 (Retry-After) and 503 as
+    # retryable; we also retry 504 and httpx network/timeout errors. Without
+    # this, a single blip makes Sync return HTTP-wrapped "error" and the
+    # caller treats it as "no new mail".
+    _RETRY_STATUSES = (449, 503, 504, 507)
+    _RETRY_DELAYS = (2.0, 4.0, 8.0)
+
     def _post(self, cmd: str, wbxml: bytes) -> httpx.Response:
-        return self.client.post(
-            self.url,
-            params={"Cmd": cmd, "User": self.username,
-                    "DeviceId": self.device_id,
-                    "DeviceType": self.device_type},
-            headers={"MS-ASProtocolVersion": self.protocol_version,
-                     "Content-Type": "application/vnd.ms-sync.wbxml"},
-            content=wbxml,
-        )
+        with self._lock:
+            last_exc: Optional[Exception] = None
+            for attempt in range(len(self._RETRY_DELAYS) + 1):
+                try:
+                    resp = self.client.post(
+                        self.url,
+                        params={"Cmd": cmd, "User": self.username,
+                                "DeviceId": self.device_id,
+                                "DeviceType": self.device_type},
+                        headers={"MS-ASProtocolVersion": self.protocol_version,
+                                 "Content-Type": "application/vnd.ms-sync.wbxml"},
+                        content=wbxml,
+                    )
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    last_exc = e
+                    if attempt >= len(self._RETRY_DELAYS):
+                        raise
+                    wait = self._RETRY_DELAYS[attempt]
+                    logger.warning("EAS %s transport error: %s, retry in %.0fs",
+                                   cmd, e, wait)
+                    time.sleep(wait)
+                    continue
+
+                if resp.status_code in self._RETRY_STATUSES and attempt < len(self._RETRY_DELAYS):
+                    wait = self._RETRY_DELAYS[attempt]
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = max(wait, float(retry_after))
+                        except ValueError:
+                            pass
+                    logger.warning("EAS %s HTTP %d, retry in %.0fs",
+                                   cmd, resp.status_code, wait)
+                    time.sleep(wait)
+                    continue
+                return resp
+            # All retries exhausted on transport errors with no response
+            raise RuntimeError(f"EAS {cmd} failed after retries") from last_exc
 
     def _decode(self, resp: httpx.Response) -> list:
         if resp.status_code == 200 and resp.content:
@@ -309,11 +351,21 @@ class EASClient:
     def _save_state(self):
         if not self.state_file:
             return
+        # Atomic write: a crash mid-write leaves the old file intact
+        # instead of corrupting state with a partial JSON.
+        tmp = self.state_file + ".tmp"
         try:
-            with open(self.state_file, 'w') as f:
+            with open(tmp, 'w') as f:
                 json.dump({"sync_keys": self.sync_keys, "incr_keys": self.incr_keys}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.state_file)
         except Exception as e:
             logger.error("Failed to save state: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # --- Incremental sync ---
     def sync_incremental(self, collection_id: str, window_size: int = 50,
@@ -324,81 +376,100 @@ class EASClient:
         (without returning them) to establish baseline. Subsequent calls
         return only new items.
 
+        On Status=3/12 (server-side SyncKey reset) returns
+        status="reset_needed" and clears the stored key. The caller is
+        expected to bridge the gap via its own cursor (e.g. timestamp +
+        Message-ID dedup) — blindly re-draining here loses any items
+        that arrived between the reset and the next successful sync.
+
         Returns dict with status, sync_key, elements, is_initial.
         """
-        stored_key = self.incr_keys.get(str(collection_id))
+        with self._lock:
+            stored_key = self.incr_keys.get(str(collection_id))
 
-        if not stored_key:
-            # First time: drain all existing items to establish baseline
-            logger.info("Initial sync for folder %s — draining existing items", collection_id)
-            r1 = self.sync(collection_id, "0")
-            key = r1.get("sync_key")
-            if not key:
-                return {"status": "error", "elements": [], "is_initial": True}
+            if not stored_key:
+                # First time: drain all existing items to establish baseline
+                logger.info("Initial sync for folder %s — draining existing items", collection_id)
+                r1 = self.sync(collection_id, "0")
+                key = r1.get("sync_key")
+                if not key:
+                    return {"status": "error", "elements": [], "is_initial": True}
 
-            # Drain loop: keep syncing until no more items
-            total_drained = 0
-            while True:
-                r = self.sync(collection_id, key, window_size=500,
-                             body_type="1", body_size="0")
-                new_key = r.get("sync_key")
-                status = r.get("status")
+                # Drain loop: keep syncing until no more items
+                total_drained = 0
+                while True:
+                    r = self.sync(collection_id, key, window_size=500,
+                                 body_type="1", body_size="0")
+                    new_key = r.get("sync_key")
+                    status = r.get("status")
 
-                if status == "no_changes" or not r.get("elements"):
-                    # Fully drained
+                    if status == "no_changes" or not r.get("elements"):
+                        # Fully drained
+                        if new_key:
+                            key = new_key
+                        break
+
+                    count = len([e for e in r.get("elements", []) if e[1] == "ServerId" and e[2]])
+                    total_drained += count
                     if new_key:
                         key = new_key
-                    break
 
-                count = len([e for e in r.get("elements", []) if e[1] == "ServerId" and e[2]])
-                total_drained += count
-                if new_key:
-                    key = new_key
+                    if count == 0:
+                        break
 
-                if count == 0:
-                    break
+                self.incr_keys[str(collection_id)] = key
+                self._save_state()
+                logger.info("Initial sync done for folder %s: drained %d items, key=%s",
+                           collection_id, total_drained, key)
 
-            self.incr_keys[str(collection_id)] = key
-            self._save_state()
-            logger.info("Initial sync done for folder %s: drained %d items, key=%s",
-                       collection_id, total_drained, key)
+                return {
+                    "status": "initial_sync_done",
+                    "sync_key": key,
+                    "elements": [],
+                    "is_initial": True,
+                    "drained": total_drained,
+                }
+
+            # Incremental: use stored key — only new items
+            r = self.sync(collection_id, stored_key, window_size=window_size,
+                         body_type=body_type, body_size=body_size)
+
+            new_key = r.get("sync_key")
+            status = r.get("status")
+
+            # Invalid SyncKey on server — drop stored key and tell the caller
+            # to recover via its own cursor. Do NOT re-drain automatically:
+            # if the drain is interrupted we lose whatever arrived between
+            # the reset and the next sync.
+            if status in ("3", "12"):
+                logger.warning(
+                    "SyncKey invalid for folder %s (status=%s); dropping stored key, "
+                    "caller must bridge the gap via its own cursor",
+                    collection_id, status,
+                )
+                self.incr_keys.pop(str(collection_id), None)
+                self._save_state()
+                return {
+                    "status": "reset_needed",
+                    "sync_key": None,
+                    "elements": [],
+                    "is_initial": False,
+                }
+
+            if status == "no_changes":
+                return {"status": "no_changes", "sync_key": stored_key,
+                        "elements": [], "is_initial": False}
+
+            if new_key:
+                self.incr_keys[str(collection_id)] = new_key
+                self._save_state()
 
             return {
-                "status": "initial_sync_done",
-                "sync_key": key,
-                "elements": [],
-                "is_initial": True,
-                "drained": total_drained,
+                "status": status,
+                "sync_key": new_key,
+                "elements": r.get("elements", []),
+                "is_initial": False,
             }
-
-        # Incremental: use stored key — only new items
-        r = self.sync(collection_id, stored_key, window_size=window_size,
-                     body_type=body_type, body_size=body_size)
-
-        new_key = r.get("sync_key")
-        status = r.get("status")
-
-        if status == "no_changes":
-            return {"status": "no_changes", "sync_key": stored_key,
-                    "elements": [], "is_initial": False}
-
-        if new_key:
-            self.incr_keys[str(collection_id)] = new_key
-            self._save_state()
-
-        # Handle invalid sync key (server reset)
-        if status in ("3", "12"):
-            logger.warning("SyncKey invalid, resetting for folder %s", collection_id)
-            del self.incr_keys[str(collection_id)]
-            self._save_state()
-            return self.sync_incremental(collection_id, window_size, body_type, body_size)
-
-        return {
-            "status": status,
-            "sync_key": new_key,
-            "elements": r.get("elements", []),
-            "is_initial": False,
-        }
 
     # --- FolderSync ---
     def folder_sync(self) -> dict:
@@ -486,51 +557,53 @@ class EASClient:
 
     def sync_folder(self, collection_id: str, **kwargs) -> dict:
         """Full sync: fetches ALL items by looping until Exchange has no more."""
-        r1 = self.sync(collection_id, "0")
-        key = r1.get("sync_key")
-        if not key:
-            return r1
+        with self._lock:
+            r1 = self.sync(collection_id, "0")
+            key = r1.get("sync_key")
+            if not key:
+                return r1
 
-        all_elements = []
-        max_rounds = 50  # safety limit
-        for _ in range(max_rounds):
-            r = self.sync(collection_id, key, **kwargs)
-            new_key = r.get("sync_key")
-            elements = r.get("elements", [])
-            status = r.get("status")
+            all_elements = []
+            max_rounds = 50  # safety limit
+            for _ in range(max_rounds):
+                r = self.sync(collection_id, key, **kwargs)
+                new_key = r.get("sync_key")
+                elements = r.get("elements", [])
+                status = r.get("status")
 
-            # Count actual items (ServerId tags = items)
-            item_count = sum(1 for _, tag, val in elements if tag == "ServerId" and val)
+                # Count actual items (ServerId tags = items)
+                item_count = sum(1 for _, tag, val in elements if tag == "ServerId" and val)
 
-            if elements:
-                all_elements.extend(elements)
+                if elements:
+                    all_elements.extend(elements)
 
-            if new_key and new_key != key:
-                key = new_key
-            else:
-                break  # key didn't change = nothing more
+                if new_key and new_key != key:
+                    key = new_key
+                else:
+                    break  # key didn't change = nothing more
 
-            if status == "no_changes" or item_count == 0:
-                break
+                if status == "no_changes" or item_count == 0:
+                    break
 
-            logger.info("sync_folder loop: got %d items, continuing...", item_count)
+                logger.info("sync_folder loop: got %d items, continuing...", item_count)
 
-        logger.info("sync_folder complete: %d total elements",
-                    sum(1 for _, tag, val in all_elements if tag == "ServerId" and val))
+            logger.info("sync_folder complete: %d total elements",
+                        sum(1 for _, tag, val in all_elements if tag == "ServerId" and val))
 
-        return {
-            "status": "1",
-            "sync_key": key,
-            "elements": all_elements,
-        }
+            return {
+                "status": "1",
+                "sync_key": key,
+                "elements": all_elements,
+            }
 
     def sync_folder_filtered(self, collection_id: str, filter_type: str = "5", **kwargs) -> dict:
         """Sync with date filter. filter_type: 4=2weeks, 5=1month, 6=3months, 7=6months"""
-        r1 = self.sync(collection_id, "0", filter_type=filter_type)
-        key = r1.get("sync_key")
-        if not key:
-            return r1
-        return self.sync(collection_id, key, filter_type=filter_type, **kwargs)
+        with self._lock:
+            r1 = self.sync(collection_id, "0", filter_type=filter_type)
+            key = r1.get("sync_key")
+            if not key:
+                return r1
+            return self.sync(collection_id, key, filter_type=filter_type, **kwargs)
 
     # --- Parsers ---
     def parse_emails(self, elements: list) -> list:
@@ -621,7 +694,7 @@ class EASClient:
                 s += "Z"
             try:
                 return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
-            except:
+            except ValueError:
                 return None
 
         range_start = datetime.strptime(date_from, "%Y%m%d")
@@ -647,7 +720,7 @@ class EASClient:
             # Recurring event - expand
             try:
                 rec_type = int(rec_type)
-            except:
+            except (ValueError, TypeError):
                 result.append(ev)
                 continue
 
