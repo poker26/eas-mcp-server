@@ -65,6 +65,7 @@ class EASBackend:
             state_file=state_file,
         )
         self._folders_cached: Optional[dict] = None
+        self._last_error: Optional[str] = None
 
     # --- MailBackend -------------------------------------------------
     def healthcheck(self) -> bool:
@@ -76,10 +77,17 @@ class EASBackend:
             folders = self._client.folder_sync()
             if folders:
                 self._folders_cached = folders
-            return bool(folders)
+                self._last_error = None
+                return True
+            self._last_error = "folder_sync returned empty"
+            return False
         except Exception as e:
+            self._last_error = f"{type(e).__name__}: {e}"
             logger.debug("EAS healthcheck failed: %s", e)
             return False
+
+    def last_error(self) -> Optional[str]:
+        return self._last_error
 
     def list_folders(self) -> list[FolderInfo]:
         folders = self._folders_cached or self._client.folder_sync()

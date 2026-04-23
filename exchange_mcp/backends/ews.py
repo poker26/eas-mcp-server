@@ -37,7 +37,7 @@ class EWSBackend:
 
     def __init__(self) -> None:
         self._account = None
-        self._account_err: Optional[str] = None
+        self._last_error: Optional[str] = None
         self._init_lock = threading.Lock()
 
     # --- lazy init ---------------------------------------------------
@@ -72,27 +72,41 @@ class EWSBackend:
                 # Triggers a real request to prove credentials work.
                 _ = self._account.root
                 logger.info("EWS account initialized for %s", email)
-                self._account_err = None
+                self._last_error = None
             except Exception as e:
                 self._account = None
-                self._account_err = f"{type(e).__name__}: {e}"
-                logger.warning("EWS init failed: %s", self._account_err)
-                raise BackendError(self._account_err) from e
+                self._last_error = f"{type(e).__name__}: {e}"
+                logger.warning("EWS init failed: %s", self._last_error)
+                raise BackendError(self._last_error) from e
         return self._account
 
     # --- MailBackend -------------------------------------------------
     def healthcheck(self) -> bool:
+        # Direct HEAD to /EWS/Exchange.asmx — cheap, won't trigger
+        # exchangelib's auth-type probing or its retry back-off logic.
+        # Any HTTP response < 500 means IIS is alive; 401 without creds
+        # is the expected "sign of life". Actual auth is validated on
+        # first real tool call via _account_or_raise().
         try:
-            acct = self._account_or_raise()
-            # Cheap read against a known folder; confirms auth + reachability.
-            _ = acct.inbox.name  # type: ignore[attr-defined]
-            return True
+            import requests  # transitively provided by exchangelib
+            resp = requests.head(
+                settings.ews_effective_url,
+                timeout=5,
+                verify=settings.verify,
+                allow_redirects=False,
+            )
+            if resp.status_code < 500:
+                self._last_error = None
+                return True
+            self._last_error = f"HTTP {resp.status_code}"
+            return False
         except Exception as e:
+            self._last_error = f"{type(e).__name__}: {e}"
             logger.debug("EWS healthcheck failed: %s", e)
             return False
 
     def last_error(self) -> Optional[str]:
-        return self._account_err
+        return self._last_error
 
     def list_folders(self) -> list[FolderInfo]:
         acct = self._account_or_raise()
