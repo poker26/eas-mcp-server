@@ -22,10 +22,8 @@ def exchange_get_new_emails(
 ) -> dict:
     """Return new emails since the last call (incremental, per-folder).
 
-    Uses a shared cursor + Message-ID LRU under the hood, so this is
-    safe across EWS ↔ EAS failovers: you won't get duplicates when
-    the channel switches, and you won't miss mail that arrived during
-    a brief outage.
+    Backed by a per-folder timestamp cursor + bounded Message-ID LRU so
+    repeated polls don't replay the same messages.
 
     Args:
         folder_id: folder id from `exchange_list_folders`; defaults to Inbox.
@@ -85,7 +83,7 @@ def exchange_send_email(
     cc: Optional[list[str]] = None,
     body_is_html: bool = False,
 ) -> dict:
-    """Send an email via the preferred channel (EWS only in v0.1).
+    """Send an email via EWS.
 
     Args:
         to: list of recipient addresses.

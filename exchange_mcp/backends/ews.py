@@ -17,7 +17,7 @@ from .base import BackendError, CalendarItem, FolderInfo, MailBackend, MailItem
 logger = logging.getLogger(__name__)
 
 
-# EAS folder type codes we mirror, so tools/ can pick Inbox/Calendar by number.
+# Role codes for well-known folders, so tools/ can pick Inbox/Calendar by number.
 _EWS_FOLDER_TYPE = {
     "inbox": 2,
     "drafts": 3,

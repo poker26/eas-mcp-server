@@ -1,16 +1,12 @@
-# Exchange MCP (hybrid EWS + EAS)
+# Exchange MCP
 
-MCP server that talks to an on-premise Exchange mailbox via **two
-independent channels** with automatic mutual fallback:
+MCP server that exposes an on-premise Exchange mailbox (EWS) to MCP
+clients such as n8n or Claude Code. Folders, mail, calendar, contacts
+and send-mail via the usual `exchange_*` tool family.
 
-- **EWS** (SOAP over HTTPS, via VPN) — primary channel when the VPN is up
-- **EAS** (ActiveSync, direct from internet) — fallback when the VPN is down
-
-A single process exposes the usual `exchange_*` MCP tools. Clients
-(n8n, Claude) see a stable contract and don't know which channel served
-the request. State (per-folder cursors + Message-ID LRU for dedup) is
-shared between the two channels, so channel switches never lose or
-duplicate mail.
+Per-folder timestamp cursor + Message-ID LRU deduplicate
+`exchange_get_new_emails`, so repeated polls don't replay the same
+messages.
 
 ## Layout
 
@@ -26,12 +22,9 @@ exchange_mcp/
   backends/
     base.py           # MailBackend protocol + DTO
     ews.py            # exchangelib-based driver
-    eas.py            # wrapper around the patched eas_client.py
-  eas_client.py       # ported EAS WBXML client (with hardening fixes)
-  router.py           # MailRouter: preferred/fallback, healthcheck, dedup
+  router.py           # Service wrapper over EWS
   health.py           # GET /health
   mcp_server.py       # FastMCP registration
-  rest_api.py         # /api/v1/* REST mirror
   main.py             # FastAPI + FastMCP mount
   tools/
     __init__.py       # ALL_TOOLS
@@ -53,43 +46,38 @@ curl http://127.0.0.1:8903/health
 
 Endpoints:
 
-- `GET /health` — unauthenticated, shows both channels' status
+- `GET /health` — unauthenticated liveness probe (HEAD to `/EWS/Exchange.asmx`)
 - `POST /mcp` — MCP transport (requires `X-API-Key` or `Authorization: Bearer ...`)
-- `GET /docs` — Swagger for the REST mirror
 
 ## Status
 
 v0.1 skeleton. Working:
 
-- `/health` with real EWS + EAS reachability checks
-- `exchange_list_folders` (EWS)
-- `exchange_get_new_emails` (router: EWS primary, EAS fallback, dedup by
-  `InternetMessageId`, per-folder timestamp cursor)
+- `/health` with EWS reachability check (anonymous HEAD — no auth spam)
+- `exchange_list_folders`
+- `exchange_get_new_emails` (per-folder cursor + Message-ID dedup)
+- `exchange_get_emails` (non-incremental, last month)
+- `exchange_send_email`
 
 Stubs / TODO:
 
-- `exchange_get_emails` (non-incremental listing)
 - `exchange_get_calendar` / `exchange_get_new_events`
 - `exchange_get_contacts`
 - `exchange_search_emails`
-- `exchange_send_email`, `exchange_create_event`
 - `exchange_get_attachment`
-- REST mirror
 - Unit tests
 
 ## Design notes
 
-See the plan document that spawned this scaffold
-(`/root/.claude/plans/polymorphic-hugging-rabbit.md` in the session
-where this was generated). Key decisions:
-
 - State is tracked by **timestamp + Message-ID**, not by native
-  SyncKey / SyncState. That lets the two channels share one cursor
-  and survives SyncKey resets with zero data loss.
-- Preferred backend is decided per-request with a 60-second cached
-  healthcheck; a single failure flips preference until the next
-  healthcheck clears it.
-- EAS hardening (atomic state, retries, `reset_needed` on Status=3/12,
-  RLock, narrow excepts) lives in the ported `eas_client.py`. It was
-  originally committed on the `eas-mcp-server` repo, branch
-  `claude/analyze-email-detection-VU9rq`.
+  SyncKey / SyncState. This survives account moves and works with any
+  backend that returns `datetime_received` and `InternetMessageId`.
+- `healthcheck()` is a plain anonymous `HEAD` to the EWS endpoint — a
+  401 with `WWW-Authenticate` is the expected "alive" answer. Real auth
+  is validated on the first tool call, not on every probe.
+- `router.py` is a single-backend wrapper today. The `MailBackend`
+  Protocol is kept as a hook so a second backend (IMAP, Graph, etc.)
+  can be added without touching `tools/`.
+- The EAS channel (ActiveSync/WBXML) originally co-habited this server
+  as a failover; it now lives in its own repo (`eas-mcp-server`) and
+  the two run as independent MCPs.

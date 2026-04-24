@@ -14,11 +14,10 @@ def build_mcp() -> FastMCP:
     mcp = FastMCP(
         name="exchange-mcp",
         instructions=(
-            "Exchange MCP server with hybrid EWS+EAS backend and automatic "
-            "fallback. Tools expose folders, mail, calendar, contacts and "
-            "search. Each call is routed to the healthier channel; state "
-            "(per-folder cursor + Message-ID LRU) is shared so clients "
-            "never see duplicates or gaps across channel switches."
+            "Exchange MCP server (EWS backend). Tools expose folders, "
+            "mail, calendar, contacts and search. A per-folder timestamp "
+            "cursor plus a Message-ID LRU dedup new-mail calls so clients "
+            "don't see the same message twice on repeated polls."
         ),
     )
     for fn in ALL_TOOLS:

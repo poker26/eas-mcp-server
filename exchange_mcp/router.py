@@ -1,17 +1,18 @@
-"""Routes each call to the preferred backend, falling back on failure.
+"""Thin service over the EWS backend.
 
 State flow for `get_new_mail`:
-    1. Pick preferred backend by the most recent healthcheck result.
-    2. Compute query window: `since = cursor - SAFETY_MARGIN` (or None
-       if no cursor yet). Safety margin bridges clock drift and ensures
-       we never miss mail on channel switches.
-    3. Fetch items from backend.
-    4. Filter against Message-ID LRU → new items only.
-    5. Advance cursor to max(received) of returned items.
-    6. Record new Message-IDs in LRU.
+    1. Compute query window: `since = cursor - SAFETY_MARGIN` (or None
+       if no cursor yet). Safety margin bridges clock drift.
+    2. Fetch items from EWS.
+    3. Filter against Message-ID LRU → new items only.
+    4. Advance cursor to max(received) of returned items.
+    5. Record new Message-IDs in LRU.
 
-If the preferred backend raises BackendError or times out, we flip it
-to unhealthy, try the other one, and log the switch.
+Originally designed as a router that could fall back to an EAS channel
+when VPN was down; EAS was split off into its own MCP server, so this
+layer is now a single-backend wrapper. The Protocol and `_try` helper
+are kept as hooks for future backends (IMAP, Graph, etc.) without
+rewriting tools/.
 """
 from __future__ import annotations
 
@@ -24,29 +25,23 @@ from typing import Optional
 
 from .backends.base import BackendError, FolderInfo, MailBackend, MailItem
 from .backends.ews import EWSBackend
-from .backends.eas import EASBackend
 from .config import settings
 from .state import SharedState
 
 logger = logging.getLogger(__name__)
 
 
-# Overlap applied to the cursor on every query — avoids edge-case misses
-# from clock skew and eventual-consistency windows on the Exchange side.
 _SAFETY_MARGIN = timedelta(minutes=5)
-
-# How long a healthcheck result stays fresh.
 _HEALTH_TTL = 60.0  # seconds
 
 
 class MailRouter:
     def __init__(self) -> None:
         self.ews = EWSBackend()
-        self.eas = EASBackend()
         self.state = SharedState(
             path=os.path.join(settings.state_dir, "router_state.json"),
         )
-        self._health: dict[str, tuple[bool, float]] = {}  # name -> (ok, ts)
+        self._health: dict[str, tuple[bool, float]] = {}
         self._health_lock = threading.RLock()
 
     # --- health ------------------------------------------------------
@@ -71,47 +66,34 @@ class MailRouter:
             self._health[backend.name] = (False, time.monotonic())
 
     def health_snapshot(self) -> dict:
-        snapshot: dict[str, dict] = {}
-        for b in (self.ews, self.eas):
-            ok = self._healthy(b)
-            last_err = getattr(b, "last_error", lambda: None)()
-            snapshot[b.name] = {"ok": ok, "last_error": last_err}
-        snapshot["preferred"] = self._preferred_name()
-        return snapshot
+        ok = self._healthy(self.ews)
+        last_err = getattr(self.ews, "last_error", lambda: None)()
+        return {
+            "ews": {"ok": ok, "last_error": last_err},
+            "preferred": "ews",
+        }
 
     # --- routing -----------------------------------------------------
-    def _preferred_name(self) -> str:
-        return "ews" if settings.preferred_backend.lower() == "ews" else "eas"
-
     def _backend_order(self) -> list[MailBackend]:
-        if self._preferred_name() == "ews":
-            return [self.ews, self.eas]
-        return [self.eas, self.ews]
+        return [self.ews]
 
     def _try(self, op_name: str, fn):
-        """Run `fn(backend)` on the preferred backend, fall back on failure."""
-        order = self._backend_order()
-        last_exc: Optional[Exception] = None
-        for i, backend in enumerate(order):
-            if not self._healthy(backend) and i < len(order) - 1:
-                logger.info("%s: skipping %s (unhealthy)", op_name, backend.name)
-                continue
-            try:
-                return fn(backend), backend
-            except BackendError as e:
-                last_exc = e
-                logger.warning("%s on %s: %s — falling back", op_name, backend.name, e)
-                self._mark_unhealthy(backend)
-                continue
-            except Exception as e:
-                last_exc = e
-                logger.warning(
-                    "%s on %s raised %s — falling back",
-                    op_name, backend.name, type(e).__name__,
-                )
-                self._mark_unhealthy(backend)
-                continue
-        raise BackendError(f"{op_name}: all backends failed ({last_exc})")
+        """Run `fn(backend)` on EWS. Kept as a wrapper so tools/ can stay
+        backend-agnostic if we add a second channel later."""
+        backend = self.ews
+        try:
+            return fn(backend), backend
+        except BackendError as e:
+            self._mark_unhealthy(backend)
+            logger.warning("%s on %s: %s", op_name, backend.name, e)
+            raise
+        except Exception as e:
+            self._mark_unhealthy(backend)
+            logger.warning(
+                "%s on %s raised %s: %s",
+                op_name, backend.name, type(e).__name__, e,
+            )
+            raise BackendError(f"{op_name}: {type(e).__name__}: {e}") from e
 
     # --- operations --------------------------------------------------
     def list_folders(self) -> tuple[list[FolderInfo], str]:

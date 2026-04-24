@@ -8,10 +8,9 @@ def exchange_list_folders() -> dict:
     """List mailbox folders (Inbox, Sent, Calendar, etc.) with IDs and types.
 
     Returns a JSON-serializable dict with a "folders" key. Each folder
-    has {id, name, type, parent}. `type` follows the EAS FolderSync
-    numeric codes (2=Inbox, 5=Sent, 8=Calendar, 9=Contacts, etc.), so
-    downstream code can pick folders by semantic role without knowing
-    which channel served the request.
+    has {id, name, type, parent}. `type` is a small integer role code
+    (2=Inbox, 3=Drafts, 4=Deleted, 5=Sent, 8=Calendar, 9=Contacts, etc.)
+    so downstream code can pick folders by semantic role instead of name.
     """
     folders, backend = router.list_folders()
     return {

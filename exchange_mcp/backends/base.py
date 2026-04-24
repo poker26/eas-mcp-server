@@ -1,8 +1,9 @@
-"""Common interface and DTO shared by EWS and EAS drivers.
+"""Backend interface and DTOs for the EWS driver.
 
-Both drivers normalize their native objects to `MailItem` / `FolderInfo`
-so the router and MCP tools don't have to care which channel served a
-request. InternetMessageId is canonical for dedup across channels.
+The driver normalizes exchangelib objects to `MailItem` / `FolderInfo`
+so the router and MCP tools stay backend-agnostic. The Protocol is
+kept as an extension point for future backends (IMAP, Graph, etc.).
+InternetMessageId is used as the dedup key.
 """
 from __future__ import annotations
 
@@ -15,17 +16,16 @@ from typing import Protocol, Optional, runtime_checkable
 class FolderInfo:
     id: str
     name: str
-    # 2=Inbox, 5=Sent, 6=Deleted, 8=Calendar, 9=Contacts, 17=Calendar (generic);
-    # follows EAS FolderSync "Type". EWS driver maps its well-known names to
-    # the same numeric codes so the REST/MCP layer stays protocol-agnostic.
+    # Role code: 2=Inbox, 3=Drafts, 4=Deleted, 5=Sent, 8=Calendar, 9=Contacts.
+    # Lets the MCP layer pick folders by role instead of localized name.
     type: Optional[int] = None
     parent: Optional[str] = None
 
 
 @dataclass
 class MailItem:
-    backend: str               # "ews" or "eas"
-    server_id: str             # channel-native id; not portable across channels
+    backend: str               # backend name, e.g. "ews"
+    server_id: str             # backend-native id; not portable across backends
     message_id: str            # RFC 5322 Message-ID — portable, dedup key
     subject: str = ""
     sender: str = ""
@@ -89,15 +89,14 @@ class CalendarItem:
 class BackendError(Exception):
     """Raised by a driver on an unrecoverable protocol error.
 
-    The router treats BackendError as an unhealthy signal and falls back
-    to the other channel. Transient errors should be retried inside the
-    driver (e.g. EAS `_post` already does that) before surfacing.
+    The router marks the backend unhealthy on BackendError. Transient
+    errors should be retried inside the driver before surfacing.
     """
 
 
 @runtime_checkable
 class MailBackend(Protocol):
-    name: str                  # "ews" or "eas"
+    name: str                  # backend name, e.g. "ews"
 
     def healthcheck(self) -> bool: ...
     def list_folders(self) -> list[FolderInfo]: ...
