@@ -51,16 +51,23 @@ class EWSBackend:
                 # Import inside the method so a missing exchangelib or a bad
                 # env doesn't prevent the process from booting.
                 from exchangelib import (  # type: ignore[import-not-found]
-                    Account, Configuration, Credentials, DELEGATE, FaultTolerance,
+                    Account, Configuration, Credentials, DELEGATE, FaultTolerance, BASIC,
                 )
                 creds = Credentials(
                     username=settings.exchange_user,
                     password=settings.exchange_password,
                 )
+                # auth_type=BASIC disables exchangelib's auth-type probe —
+                # without it, the first init fires 2–3 anonymous requests
+                # to detect NTLM/Negotiate/Basic, each of which can count
+                # as a failed login against AD lockout policy.
+                # max_wait=0 disables retry back-off: on bad creds we get
+                # one clean 401 instead of a cascade of attempts.
                 config = Configuration(
                     service_endpoint=settings.ews_effective_url,
                     credentials=creds,
-                    retry_policy=FaultTolerance(max_wait=60),
+                    auth_type=BASIC,
+                    retry_policy=FaultTolerance(max_wait=0),
                 )
                 email = settings.exchange_email or settings.exchange_user
                 self._account = Account(
