@@ -493,21 +493,15 @@ api = FastAPI(
     redoc_url="/redoc",
 )
 
-_rest_eas = None
-
 def _rest_client():
-    global _rest_eas
-    if _rest_eas is None:
-        _rest_eas = EASClient(
-            host=EAS_HOST,
-            username=EAS_USERNAME,
-            password=EAS_PASSWORD,
-            device_id=EAS_DEVICE_ID,
-            protocol_version=EAS_PROTOCOL,
-            email_address=EAS_EMAIL,
-        )
-        _rest_eas.folder_sync()
-    return _rest_eas
+    """REST endpoints share the process-global EASClient with MCP tools.
+
+    REST handlers don't have an MCP Context, so we delegate to get_client(None),
+    which falls through to the same _global_eas as MCP tools. One client per
+    process keeps SyncKey state coherent across REST and MCP entry points and
+    avoids two clients racing on the same state file.
+    """
+    return get_client(None)
 
 
 def _verify_key(x_api_key: str = Header(default=None), authorization: str = Header(default=None)):
