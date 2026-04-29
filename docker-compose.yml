@@ -11,6 +11,7 @@ services:
       - EAS_PASSWORD=${EAS_PASSWORD}
       - EAS_DEVICE_ID=EAS0LEGCLIENT0001
       - EAS_PROTOCOL=14.1
+      - API_KEY=${API_KEY}
     ports:
       - "127.0.0.1:8900:8000"
     # Uncomment labels below if using Traefik reverse proxy

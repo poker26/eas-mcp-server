@@ -1017,10 +1017,78 @@ class RewriteHostMiddleware:
         await self.app(scope, receive, send)
 
 
+class AuthMiddleware:
+    """Require X-API-Key (or Authorization: Bearer ...) on every HTTP path
+    except those in `public_paths`.
+
+    Sits in front of CombinedApp so it covers BOTH the FastMCP transport
+    (/mcp/*) and the FastAPI app (/api/*, /docs, /redoc, /openapi.json).
+    Per-handler _verify_key in /api/* stays as defense-in-depth.
+
+    Behavior:
+    - HTTP scopes only; lifespan/websocket are passed through untouched.
+    - Match against `api_key` is constant-time (hmac.compare_digest).
+    - Bad/missing key → 401 with a uniform body — no hint about which
+      header was tried, so we don't help fingerprinting.
+    """
+
+    def __init__(self, app, api_key: str, public_paths: set):
+        self.app = app
+        self.api_key = api_key
+        self.public_paths = public_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in self.public_paths:
+            await self.app(scope, receive, send)
+            return
+        import hmac
+        if hmac.compare_digest(self._extract_token(scope), self.api_key):
+            await self.app(scope, receive, send)
+            return
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"www-authenticate", b'Bearer realm="eas-mcp"'),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b'{"detail":"Unauthorized"}'})
+
+    @staticmethod
+    def _extract_token(scope) -> str:
+        x_api_key = b""
+        authorization = b""
+        for k, v in scope.get("headers", []):
+            if k == b"x-api-key":
+                x_api_key = v
+            elif k == b"authorization":
+                authorization = v
+        if x_api_key:
+            return x_api_key.decode("ascii", "ignore")
+        if authorization.startswith(b"Bearer "):
+            return authorization[7:].decode("ascii", "ignore")
+        return ""
+
+
 if __name__ == "__main__":
     import sys
     if "--http" in sys.argv:
         import uvicorn
+        # Hard requirement: refuse to start without an API_KEY. Without this
+        # check, _verify_key() falls into a permissive branch and the whole
+        # server (including /docs, /openapi.json, /mcp/*) is open to anyone
+        # who can reach the host.
+        if not API_KEY:
+            raise SystemExit(
+                "API_KEY env var is required. "
+                "Generate one with: python3 -c 'import secrets; "
+                "print(secrets.token_urlsafe(48))'"
+            )
         port = 8000
         for arg in sys.argv[1:]:
             if arg.startswith("--port="):
@@ -1044,7 +1112,11 @@ if __name__ == "__main__":
                 else:
                     await self.rest(scope, receive, send)
 
-        app = CombinedApp(mcp_wrapped, api)
+        app = AuthMiddleware(
+            CombinedApp(mcp_wrapped, api),
+            api_key=API_KEY,
+            public_paths={"/api/health"},
+        )
         uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         logger.info("Starting MCP server on stdio")
